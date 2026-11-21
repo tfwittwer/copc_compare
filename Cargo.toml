@@ -7,6 +7,7 @@ license = "MIT"
 
 [dependencies]
 anyhow = "1"
+indicatif = "0.18"
 kiddo = { version = "6", default-features = false, features = ["multi-threaded"] }
 clap = { version = "4", features = ["derive"] }
 copc-core = "0.10"
@@ -14,6 +15,7 @@ copc-streaming = "0.2"
 las = "0.10"
 laz = "0.12"
 memmap2 = "0.9"
+nalgebra = { version = "0.34", default-features = false, features = ["std"] }
 pollster = "0.4"
 rayon = "1"
 

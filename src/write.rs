@@ -12,7 +12,7 @@
 //! i64 offset of the chunk table         patched at the end
 //! chunks, in arrival order
 //! LAZ chunk table
-//! EVLR copc/1000                        single hierarchy page, A's keys in A's order
+//! EVLR copc/1000                        hierarchy pages, A's keys (root page first)
 //! A's LASF_Projection / LASF_Spec EVLRs, verbatim
 //! ```
 
@@ -339,10 +339,10 @@ impl CopcWriter {
         self.w.write_all(&ct)?;
         self.pos += ct.len() as u64;
 
-        let page = copc_core::HierarchyPage::new(entries).write_le_bytes()?;
         let evlr_start = self.pos;
+        let (page, root_size) = hierarchy_pages(entries, evlr_start + EVLR_HEADER_SIZE)?;
         self.copc_info.root_hier_offset = evlr_start + EVLR_HEADER_SIZE;
-        self.copc_info.root_hier_size = page.len() as u64;
+        self.copc_info.root_hier_size = root_size;
         let hier = RawVlr {
             reserved: 0,
             user_id: fixed("copc"),
@@ -383,5 +383,115 @@ impl CopcWriter {
             }
         }
         Ok(WriteSummary { bytes, chunks: self.chunk_table.len(), points, point_data_bytes })
+    }
+}
+
+/// One hierarchy page before layout: its node entries and its child pages
+/// (subtree root key, page index).
+#[derive(Default)]
+struct Page {
+    entries: Vec<copc_core::Entry>,
+    children: Vec<(copc_core::VoxelKey, usize)>,
+}
+
+fn ancestor_at(k: copc_core::VoxelKey, level: i32) -> copc_core::VoxelKey {
+    let sh = k.level - level;
+    copc_core::VoxelKey { level, x: k.x >> sh, y: k.y >> sh, z: k.z >> sh }
+}
+
+/// Split `entries` into pages: entries above `boundaries[depth]` stay here; each
+/// subtree rooted at the boundary level goes to its own page (recursively).
+fn build_page(entries: Vec<copc_core::Entry>, boundaries: &[i32], depth: usize, pages: &mut Vec<Page>) -> usize {
+    let idx = pages.len();
+    pages.push(Page::default());
+    let Some(&b) = boundaries.get(depth) else {
+        pages[idx].entries = entries;
+        return idx;
+    };
+    let mut groups: std::collections::BTreeMap<(i32, i32, i32, i32), Vec<copc_core::Entry>> = Default::default();
+    let mut mine = Vec::new();
+    for e in entries {
+        if e.key.level < b {
+            mine.push(e);
+        } else {
+            let r = ancestor_at(e.key, b);
+            groups.entry((r.level, r.x, r.y, r.z)).or_default().push(e);
+        }
+    }
+    for ((level, x, y, z), group) in groups {
+        let child = build_page(group, boundaries, depth + 1, pages);
+        pages[idx].children.push((copc_core::VoxelKey { level, x, y, z }, child));
+    }
+    pages[idx].entries = mine;
+    idx
+}
+
+/// Serialize the hierarchy as nested pages laid out from file offset `base`,
+/// root page first, then the others depth-first. Page boundaries every 3 levels
+/// from level 3, as copc-converter does, so a streaming reader fetches only the
+/// pages for the region it shows. A child page is referenced from its parent by
+/// an entry with the subtree root's key and `point_count = -1`; the subtree
+/// root's own entry lives in the child page.
+///
+/// Returns the payload and the root page size.
+pub fn hierarchy_pages(entries: Vec<copc_core::Entry>, base: u64) -> Result<(Vec<u8>, u64)> {
+    let max_level = entries.iter().map(|e| e.key.level).max().unwrap_or(0);
+    let boundaries: Vec<i32> = (1..).map(|i| 3 * i).take_while(|&l| l < max_level).collect();
+    let mut pages = Vec::new();
+    build_page(entries, &boundaries, 0, &mut pages);
+
+    let size = |p: &Page| ((p.entries.len() + p.children.len()) * copc_core::HIERARCHY_ENTRY_BYTES) as u64;
+    let mut offsets = Vec::with_capacity(pages.len());
+    let mut at = base;
+    for p in &pages {
+        offsets.push(at);
+        at += size(p);
+    }
+    let mut out = Vec::with_capacity((at - base) as usize);
+    for p in &pages {
+        let mut all = p.entries.clone();
+        for &(key, child) in &p.children {
+            let byte_size = i32::try_from(size(&pages[child])).context("hierarchy page too large")?;
+            all.push(copc_core::Entry { key, offset: offsets[child], byte_size, point_count: -1 });
+        }
+        out.extend_from_slice(&copc_core::HierarchyPage::new(all).write_le_bytes()?);
+    }
+    Ok((out, size(&pages[0])))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(level: i32, x: i32, y: i32, z: i32) -> copc_core::Entry {
+        copc_core::Entry { key: copc_core::VoxelKey { level, x, y, z }, offset: 1000, byte_size: 10, point_count: 5 }
+    }
+
+    /// Root + a chain down to level 7: boundaries at 3 and 6, so three pages.
+    #[test]
+    fn pages_every_three_levels() {
+        let mut entries: Vec<_> = (0..=7).map(|l| entry(l, 0, 0, 0)).chain([entry(4, 1, 0, 0)]).collect();
+        entries.sort_by_key(|e| (e.key.level, e.key.x, e.key.y, e.key.z)); // as CopcFile::entries()
+        let (data, root) = hierarchy_pages(entries, 5000).unwrap();
+        let page = |off: u64, size: u64| {
+            copc_core::HierarchyPage::from_le_bytes(&data[(off - 5000) as usize..][..size as usize])
+                .unwrap()
+                .into_entries()
+        };
+        let p0 = page(5000, root);
+        assert_eq!(p0.iter().map(|e| (e.key.level, e.point_count)).collect::<Vec<_>>(), [(0, 5), (1, 5), (2, 5), (3, -1)]);
+        let ptr = p0[3];
+        let p1 = page(ptr.offset, ptr.byte_size as u64);
+        // Level 3 subtree: levels 3-5 (incl. the sibling at 4) plus a pointer at 6.
+        assert_eq!(p1.iter().map(|e| (e.key.level, e.point_count)).collect::<Vec<_>>(), [(3, 5), (4, 5), (4, 5), (5, 5), (6, -1)]);
+        let p2 = page(p1[4].offset, p1[4].byte_size as u64);
+        assert_eq!(p2.iter().map(|e| e.key.level).collect::<Vec<_>>(), [6, 7]);
+        assert_eq!(data.len(), (4 + 5 + 2) * 32);
+    }
+
+    #[test]
+    fn shallow_tree_is_one_page() {
+        let (data, root) = hierarchy_pages((0..=3).map(|l| entry(l, 0, 0, 0)).collect(), 0).unwrap();
+        assert_eq!((data.len() as u64, root), (4 * 32, 4 * 32));
     }
 }

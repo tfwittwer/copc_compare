@@ -14,7 +14,7 @@ use copc_streaming::Fields;
 use common::{Oracle, convert, fixture, read_back, scratch, validator, write_las};
 
 fn opts(max_dist: f64, tile_points: u64) -> Options {
-    Options { max_dist, dist_scale: None, tile_points, tiles_in_flight: 3, force: false }
+    Options { tile_points, tiles_in_flight: 3, ..Options::new(max_dist) }
 }
 
 fn run(a: &Path, b: &Path, out: &Path, o: &Options) -> c2c::Summary {
@@ -23,12 +23,20 @@ fn run(a: &Path, b: &Path, out: &Path, o: &Options) -> c2c::Summary {
     c2c::run(&a, &b, out, o).unwrap()
 }
 
-/// (position, c2c_dist raw value) for every output point, via copc-reader.
-fn values(path: &Path) -> Vec<([f64; 3], i32)> {
+/// (position, our `n` raw field values) for every output point, via copc-reader.
+fn fields_of(path: &Path, n: usize) -> Vec<([f64; 3], Vec<i32>)> {
     read_back(path)
         .into_iter()
-        .map(|(p, eb)| (p, i32::from_le_bytes(eb[eb.len() - 4..].try_into().unwrap())))
+        .map(|(p, eb)| {
+            let ours = &eb[eb.len() - 4 * n..];
+            (p, ours.chunks_exact(4).map(|b| i32::from_le_bytes(b.try_into().unwrap())).collect())
+        })
         .collect()
+}
+
+/// (position, c2c_dist raw value) for every output point of a NN-only run.
+fn values(path: &Path) -> Vec<([f64; 3], i32)> {
+    fields_of(path, 1).into_iter().map(|(p, v)| (p, v[0])).collect()
 }
 
 /// Compare every output value with the oracle's. Returns (points, beyond cap).
@@ -91,6 +99,12 @@ fn self_distance_is_zero() {
 /// for h > max_dist); beyond B's edge the oracle decides. Different scales and
 /// offsets, RD-sized coordinates.
 fn plane_pair() -> (PathBuf, PathBuf) {
+    // Built once per test binary: several tests use it and run in parallel.
+    static PAIR: std::sync::OnceLock<(PathBuf, PathBuf)> = std::sync::OnceLock::new();
+    PAIR.get_or_init(make_plane_pair).clone()
+}
+
+fn make_plane_pair() -> (PathBuf, PathBuf) {
     let (x0, y0) = (121_000.0, 486_000.0);
     let h = |i: usize, j: usize| ((i * 7 + j * 13) % 300) as f64 / 100.0;
     let b: Vec<[f64; 3]> = (0..=600)
@@ -229,4 +243,95 @@ fn crs_mismatch_needs_force() {
     assert!(!out.exists(), "nothing written on a refused run");
     let forced = Options { force: true, ..opts(0.5, u64::MAX) };
     assert_eq!(c2c::run(&a, &b, &out, &forced).unwrap().stats.beyond_cap, 0);
+}
+
+/// Flat grid with --components and --model plane: above B, dx = dy = 0,
+/// dz = c2c_plane = h. Field order: dist, dx, dy, dz, plane.
+#[test]
+fn plane_pair_components_and_plane_model() {
+    let (a, b) = plane_pair();
+    let max_dist = 2.0;
+    let mut outs = Vec::new();
+    for tile_points in [40_000, 100_000_000] {
+        let out = scratch(&format!("plane_full_{tile_points}.copc.laz"));
+        let o = Options { components: true, plane_k: Some(8), ..opts(max_dist, tile_points) };
+        let s = run(&a, &b, &out, &o);
+        assert_eq!(s.fields, ["c2c_dist", "c2c_dx", "c2c_dy", "c2c_dz", "c2c_plane"]);
+        validator::assert_valid_copc(&out);
+        let cap = (5.0 * max_dist / s.scale).round() as i32;
+        let (mut above, mut edge) = (0, 0);
+        for (p, v) in fields_of(&out, 5) {
+            let h = (p[2] / s.scale).round() as i32;
+            if p[0] - 121_000.0 <= 60.0 + 1e-6 {
+                let want = if p[2] <= max_dist { vec![h, 0, 0, h, h] } else { vec![cap; 5] };
+                assert_eq!(v, want, "point {p:?}");
+                above += 1;
+            } else if v[0] == cap {
+                assert_eq!(v, vec![cap; 5]);
+            } else {
+                // Beyond B's edge: the offset points back towards the edge.
+                assert!(v[1] > 0 && v[2] == 0, "point {p:?}: {v:?}");
+                edge += 1;
+            }
+        }
+        assert_eq!(above, 601 * 601);
+        // Only beyond the edge can the neighbours be collinear (one grid column).
+        assert!(s.stats.plane_fallbacks > 0 && s.stats.plane_fallbacks <= edge, "{} fallbacks, {edge} edge points", s.stats.plane_fallbacks);
+        outs.push(out);
+    }
+    assert_same_nodes(&outs[0], &outs[1]);
+}
+
+/// Tilted planar B; A points off the grid, offset by a known t along the plane
+/// normal. c2c_plane = t, while c2c_dist (to the nearest grid point) is larger.
+#[test]
+fn tilted_plane_model() {
+    let (x0, y0) = (121_000.0, 486_000.0);
+    let z = |x: f64, y: f64| 0.2 * x + 0.1 * y;
+    let b: Vec<[f64; 3]> = (0..=300)
+        .flat_map(|i| (0..=300).map(move |j| (i as f64 * 0.1, j as f64 * 0.1)))
+        .map(|(x, y)| [x0 + x, y0 + y, z(x, y)])
+        .collect();
+    let len = (0.2f64 * 0.2 + 0.1 * 0.1 + 1.0).sqrt();
+    let normal = [-0.2 / len, -0.1 / len, 1.0 / len];
+    let mut seed = 7;
+    let mut a = Vec::new();
+    let mut offsets = Vec::new();
+    for _ in 0..20_000 {
+        // Away from the edges, between grid nodes, at t in [-0.15, 0.15] m.
+        let (x, y) = (2.0 + 26.0 * rand01(&mut seed), 2.0 + 26.0 * rand01(&mut seed));
+        let t = 0.3 * rand01(&mut seed) - 0.15;
+        a.push([x0 + x + t * normal[0], y0 + y + t * normal[1], z(x, y) + t * normal[2]]);
+        offsets.push(t);
+    }
+    let (a_las, b_las) = (scratch("tilt_a.las"), scratch("tilt_b.las"));
+    write_las(&a_las, 0.0001, [121_000.0, 486_000.0, 0.0], &a);
+    write_las(&b_las, 0.0001, [121_000.0, 486_000.0, 0.0], &b);
+    let (a_copc, b_copc) = (scratch("tilt_a.copc.laz"), scratch("tilt_b.copc.laz"));
+    convert(&[a_las], &a_copc, None);
+    convert(&[b_las], &b_copc, None);
+
+    let out = scratch("tilt_out.copc.laz");
+    let o = Options { components: true, plane_k: Some(8), ..opts(0.5, 10_000) };
+    let s = run(&a_copc, &b_copc, &out, &o);
+    assert_eq!(s.scale, 0.0001);
+    // Match outputs to the generated offsets by position.
+    // Raw (quantised) coordinates as written: offset (121000, 486000, 0), scale 0.1 mm.
+    let raw = |p: &[f64; 3]| -> [i64; 3] {
+        let off = [121_000.0, 486_000.0, 0.0];
+        std::array::from_fn(|i| ((p[i] - off[i]) * 1e4).round() as i64)
+    };
+    let want: std::collections::HashMap<[i64; 3], f64> = a.iter().zip(&offsets).map(|(p, &t)| (raw(p), t)).collect();
+    let mut worst = 0.0f64;
+    for (p, v) in fields_of(&out, 5) {
+        let t = want[&raw(&p)];
+        let plane = f64::from(v[4]) * s.scale;
+        worst = worst.max((plane - t).abs());
+        // NN is never closer than the plane, and the components add up to it.
+        assert!(f64::from(v[0]) * s.scale >= t.abs() - 2e-4, "{p:?}: dist {} < |t| {t}", v[0]);
+        let norm = (f64::from(v[1]).powi(2) + f64::from(v[2]).powi(2) + f64::from(v[3]).powi(2)).sqrt();
+        assert!((norm - f64::from(v[0])).abs() <= 2.0, "{p:?}: |components| {norm} vs dist {}", v[0]);
+    }
+    // Coordinates are quantised to 0.1 mm, so the plane isn't exact to the bit.
+    assert!(worst < 3e-4, "plane distance off by up to {worst} m");
 }

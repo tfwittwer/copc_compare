@@ -56,6 +56,11 @@ fn constant_field() {
     assert_eq!(ho.guid, ha.guid);
     assert_eq!(las_str(&ho.generating_software), concat!("copc_compare ", env!("CARGO_PKG_VERSION")));
 
+    // Paged hierarchy: the fixture reaches level 4, so level-3 subtrees get pages.
+    let pointers = o.evlrs[0].data.chunks_exact(32).filter(|e| i32::from_le_bytes(e[28..32].try_into().unwrap()) == -1).count();
+    let level3 = a.entries().iter().filter(|e| e.key.level == 3).count();
+    assert_eq!(pointers, level3, "one child page per level-3 subtree");
+
     // A's other VLRs (here the WKT) survive verbatim.
     let wkt = |f: &CopcFile| f.vlrs.iter().find(|v| v.is("LASF_Projection", 2112)).unwrap().data.clone();
     assert_eq!(wkt(&a), wkt(&o));
