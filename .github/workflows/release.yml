@@ -1,0 +1,99 @@
+name: Release
+
+# Pushing a tag like v0.1.0 builds the binaries and publishes them as a GitHub
+# release. The release stays a draft until every build has uploaded.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  # The compiler copc_compare is developed with. Nightly is needed for kiddo's
+  # `simd` feature (on by default).
+  TOOLCHAIN: nightly-2026-03-16
+  CARGO_TERM_COLOR: always
+  GH_TOKEN: ${{ github.token }}
+
+jobs:
+  draft:
+    name: Create draft release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create draft
+        run: |
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft --verify-tag \
+            --title "$GITHUB_REF_NAME" --generate-notes --notes "$(cat <<'EOF'
+          Prebuilt `copc_compare` binaries:
+
+          - **Linux x86-64**: glibc 2.35 or newer, a CPU with AVX2 (x86-64-v3).
+          - **macOS Apple Silicon**: unsigned. If macOS blocks it, run `xattr -d com.apple.quarantine copc_compare`.
+          - **Windows x86-64**: a CPU with AVX2 (x86-64-v3).
+
+          On macOS and Windows the default memory budget is 8 GiB; set `--memory-limit` to use more.
+          For other CPUs, build from source (see README).
+          EOF
+          )"
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: draft
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            cpu: x86-64-v3
+            archive: tar.gz
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            cpu: apple-m1
+            archive: tar.gz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            cpu: x86-64-v3
+            archive: zip
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: rustup toolchain install "$TOOLCHAIN" --profile minimal --target ${{ matrix.target }}
+
+      - name: Build
+        env:
+          # Replaces target-cpu=native from .cargo/config.toml, so the binary
+          # runs on other machines than the build runner.
+          RUSTFLAGS: -C target-cpu=${{ matrix.cpu }}
+        run: cargo +"$TOOLCHAIN" build --release --locked --target ${{ matrix.target }} --bin copc_compare
+
+      - name: Package
+        run: |
+          name="copc_compare-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          bin="target/${{ matrix.target }}/release/copc_compare"
+          if [ "$RUNNER_OS" = Windows ]; then bin="$bin.exe"; fi
+          "$bin" --version
+          mkdir "$name"
+          cp "$bin" README.md LICENSE "$name/"
+          if [ "${{ matrix.archive }}" = zip ]; then
+            7z a "$name.zip" "$name" > /dev/null
+          else
+            tar czf "$name.tar.gz" "$name"
+          fi
+          echo "ASSET=$name.${{ matrix.archive }}" >> "$GITHUB_ENV"
+
+      - name: Upload to the draft release
+        run: gh release upload "$GITHUB_REF_NAME" "$ASSET" --repo "$GITHUB_REPOSITORY" --clobber
+
+  publish:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Publish
+        run: gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false

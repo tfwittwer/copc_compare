@@ -19,6 +19,18 @@ points take 136 s.
 A second command, `diff`, checks whether two COPC files hold the same points,
 regardless of point order and octree layout.
 
+## Download
+
+Prebuilt binaries are on the
+[Releases](https://github.com/tfwittwer/copc_compare/releases) page:
+
+- **Linux x86-64:** needs glibc 2.35 or newer and a CPU with AVX2 (x86-64-v3).
+- **macOS Apple Silicon:** unsigned. If macOS blocks it, run
+  `xattr -d com.apple.quarantine copc_compare`.
+- **Windows x86-64:** needs a CPU with AVX2 (x86-64-v3).
+
+For other machines, build from source.
+
 ## Build
 
 ```
@@ -38,7 +50,7 @@ cargo build --release
 | `--components` | Also write `c2c_dx`, `c2c_dy`, `c2c_dz`. |
 | `--model plane [--k 8]` | Also write `c2c_plane`. |
 | `--dist-scale S` | Distance resolution in metres. Default: the finer coordinate scale of the two files, but at least 0.1 mm. |
-| `--memory-limit 16G` | Memory budget. Default: half the RAM. It sets the tile size and how many tiles run at once. |
+| `--memory-limit 16G` | Memory budget. Default: half the RAM on Linux, 8 GiB on macOS and Windows. It sets the tile size and how many tiles run at once. |
 | `--threads N` | Worker threads. Default: all cores. |
 | `--force` | Run even if the two files declare different CRSs. |
 
