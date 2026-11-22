@@ -60,7 +60,7 @@ jobs:
       run:
         shell: bash
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         run: rustup toolchain install "$TOOLCHAIN" --profile minimal --target ${{ matrix.target }}
