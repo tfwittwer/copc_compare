@@ -35,8 +35,9 @@ simd = ["kiddo/simd"]
 [dev-dependencies]
 byteorder = "1"
 copc-reader = "0.10"
-# Synthetic COPC fixtures (LAS/LAZ -> COPC) for the tests.
-copc_converter = { path = "../tools/copc-converter" }
+# Synthetic COPC fixtures (LAS/LAZ -> COPC) for the tests. Its test data (not
+# in the crates.io package) is read from a checkout, see README.
+copc_converter = { git = "https://github.com/360-geo/copc-converter", tag = "v0.16.0" }
 
 # Dependencies optimised in the dev profile too: the tests run kd-tree queries,
 # COPC conversion and LAZ coding on a few hundred thousand points.

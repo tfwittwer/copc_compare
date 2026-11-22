@@ -289,6 +289,7 @@ dependencies = [
 [[package]]
 name = "copc_converter"
 version = "0.0.0-dev"
+source = "git+https://github.com/360-geo/copc-converter?tag=v0.16.0#08b631e398eef8d64a7361a0fc2cf51f77a46889"
 dependencies = [
  "anyhow",
  "byteorder",

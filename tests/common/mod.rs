@@ -10,9 +10,20 @@ use copc_converter::{NodeStorage, Pipeline, PipelineConfig, TempCompression};
 use copc_streaming::Fields;
 use las::point::{Classification, ScanDirection};
 
-/// A file from copc-converter's test data.
+/// A file from copc-converter's test data: `$COPC_CONVERTER_DATA`, else a
+/// checkout at `../tools/copc-converter`.
 pub fn fixture(name: &str) -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../tools/copc-converter/tests/data").join(name)
+    let dir = std::env::var_os("COPC_CONVERTER_DATA").map_or_else(
+        || Path::new(env!("CARGO_MANIFEST_DIR")).join("../tools/copc-converter/tests/data"),
+        PathBuf::from,
+    );
+    let p = dir.join(name);
+    assert!(
+        p.exists(),
+        "test fixture {} not found: set COPC_CONVERTER_DATA to copc-converter's tests/data (see README)",
+        p.display()
+    );
+    p
 }
 
 /// A fresh scratch path for this test.
