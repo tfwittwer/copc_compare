@@ -70,6 +70,10 @@ enum Cmd {
         /// Tiles processed at once (overrides the memory-derived value).
         #[arg(long, hide = true)]
         tiles_in_flight: Option<usize>,
+        /// Re-encode the compared file's chunks instead of splicing the new
+        /// fields into them (for comparisons; same output points).
+        #[arg(long, hide = true)]
+        reencode: bool,
     },
     /// Whether two COPC files hold the same points, independent of point order
     /// and octree. Compares the position and every field both files have, and
@@ -127,6 +131,9 @@ enum Cmd {
         /// Uniform random values in [0, RANDOM_MAX] instead, seeded per node.
         #[arg(long)]
         random_max: Option<f64>,
+        /// Re-encode instead of splicing the fields into the input's chunks.
+        #[arg(long)]
+        reencode: bool,
     },
 }
 
@@ -204,6 +211,7 @@ fn run(cli: Cli) -> Result<bool> {
             no_progress,
             tile_points,
             tiles_in_flight,
+            reencode,
         } => {
             let a = CopcFile::open(&compared)?;
             let b = CopcFile::open(&reference)?;
@@ -218,6 +226,7 @@ fn run(cli: Cli) -> Result<bool> {
                 tiles_in_flight: tiles_in_flight.unwrap_or(n),
                 force,
                 progress: !no_progress,
+                reencode,
             };
             c2c::run(&a, &b, &output, &opt)?;
             Ok(true)
@@ -228,7 +237,7 @@ fn run(cli: Cli) -> Result<bool> {
             Ok(diff::run(&x, &y, &opt)?.equal)
         }
         Cmd::Info { file, bench } => info::run(&file, bench).map(|()| true),
-        Cmd::Passthrough { input, output, fields, scale, value, random_max } => {
+        Cmd::Passthrough { input, output, fields, scale, value, random_max, reencode } => {
             let a = CopcFile::open(&input)?;
             let fields: Vec<ScaledField> = (0..fields)
                 .map(|i| ScaledField::new(&format!("stub_{i}"), "passthrough test value", scale))
@@ -237,7 +246,7 @@ fn run(cli: Cli) -> Result<bool> {
                 f.check_range(random_max.unwrap_or(value).abs())?;
             }
             let n = fields.len();
-            pipeline::passthrough(&a, &output, &fields, |e, chunk| {
+            pipeline::passthrough(&a, &output, &fields, reencode, |e, chunk| {
                 let k = &e.key;
                 let mut seed = ((k.level as u64) << 48) ^ ((k.x as u64) << 32) ^ ((k.y as u64) << 16) ^ (k.z as u64);
                 (0..chunk.point_count() * n)

@@ -6,7 +6,7 @@ use std::sync::mpsc;
 use std::time::Instant;
 
 use anyhow::{Result, anyhow};
-use copc_streaming::{Chunk, Fields, HierarchyEntry};
+use copc_streaming::{Chunk, HierarchyEntry};
 
 use crate::extra_bytes::ScaledField;
 use crate::input::CopcFile;
@@ -70,26 +70,32 @@ where
 }
 
 /// Phase 1 pass-through: decode every node of `a`, append the i32 values that
-/// `values` returns for it (point-major, one per field), re-encode and write.
+/// `values` returns for it (point-major, one per field), splice or (with
+/// `reencode`, or if A's chunks can't be spliced) re-encode, and write.
 /// Exercises the writer without any distance code.
 pub fn passthrough(
     a: &CopcFile,
     out: &Path,
     fields: &[ScaledField],
+    reencode: bool,
     values: impl Fn(&HierarchyEntry, &Chunk) -> Vec<i32> + Sync,
 ) -> Result<WriteSummary> {
     let t = Instant::now();
     let mut writer = CopcWriter::create(out, a, fields)?;
-    let layout = writer.layout().clone();
+    let mut layout = writer.layout().clone();
+    if reencode {
+        layout = layout.reencoding();
+    }
     let nodes: Vec<&HierarchyEntry> = a.data_entries().collect();
     let mut stats = vec![(i32::MAX, i32::MIN); fields.len()];
     ordered_parallel(
         &nodes,
         4 * rayon::current_num_threads(),
         |_, e| {
-            let chunk = a.decode(e, Fields::ALL)?;
+            let compressed = a.compressed(e);
+            let chunk = a.decode(e, layout.decode_fields(compressed))?;
             let vals = values(e, &chunk);
-            let bytes = layout.encode(chunk.cloud().raw_bytes(), &vals)?;
+            let bytes = layout.encode(compressed, &chunk, &vals)?;
             let mut s = vec![(i32::MAX, i32::MIN); fields.len()];
             for p in vals.chunks_exact(fields.len().max(1)) {
                 for (s, &v) in s.iter_mut().zip(p) {

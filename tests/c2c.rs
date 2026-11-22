@@ -11,7 +11,7 @@ use copc_compare::input::CopcFile;
 use copc_compare::tiles::Cut;
 use copc_streaming::Fields;
 
-use common::{Oracle, convert, fixture, read_back, scratch, validator, write_las};
+use common::{Oracle, cloud, convert, copc, fixture, read_back, scratch, validator, write_las};
 
 fn opts(max_dist: f64, tile_points: u64) -> Options {
     Options { tile_points, tiles_in_flight: 3, ..Options::new(max_dist) }
@@ -362,4 +362,30 @@ fn tilted_plane_model() {
     }
     // Coordinates are quantised to 0.1 mm, so the plane isn't exact to the bit.
     assert!(worst < 3e-4, "plane distance off by up to {worst} m");
+}
+
+#[test]
+fn splice_equals_reencode() {
+    // laz-rs input (copc-converter) with random scanner channels and shared
+    // nodes: splicing writes the same file as re-encoding.
+    let a = copc("c2c_splice_a", 7, [0.001; 3], [0.0; 3], &cloud(11, 60_000));
+    let b = copc("c2c_splice_b", 7, [0.001; 3], [0.0; 3], &cloud(12, 60_000));
+    let o = Options { components: true, ..opts(0.5, 10_000) };
+    let (sp, re) = (scratch("c2c_splice.copc.laz"), scratch("c2c_reenc.copc.laz"));
+    let s = run(&a, &b, &sp, &o);
+    let r = run(&a, &b, &re, &Options { reencode: true, ..o.clone() });
+    let nodes = CopcFile::open(&a).unwrap().data_entries().count() as u64;
+    assert!(s.stats.shared_points > 0, "test needs shared nodes");
+    assert_eq!((s.stats.spliced, r.stats.spliced), (nodes, 0));
+    assert!(std::fs::read(&sp).unwrap() == std::fs::read(&re).unwrap(), "spliced and re-encoded files differ");
+
+    // Untwine's fixture, written by lazperf: it encodes these chunks exactly as
+    // laz-rs does, so the files are identical too.
+    let u = fixture("untwine_reference.copc.laz");
+    let (sp, re) = (scratch("c2c_splice_u.copc.laz"), scratch("c2c_reenc_u.copc.laz"));
+    let s = run(&u, &u, &sp, &o);
+    run(&u, &u, &re, &Options { reencode: true, ..o });
+    assert_eq!(s.stats.spliced, CopcFile::open(&u).unwrap().data_entries().count() as u64);
+    assert!(std::fs::read(&sp).unwrap() == std::fs::read(&re).unwrap(), "untwine: spliced and re-encoded files differ");
+    common::assert_no_new_issues(&u, &sp);
 }

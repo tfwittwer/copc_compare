@@ -9,7 +9,8 @@ use copc_compare::pipeline::passthrough;
 use copc_reader::{BoundsSelection, CopcReader, LodSelection};
 use copc_streaming::VoxelKey;
 
-use common::{assert_no_new_issues, assert_records_extended, convert, fixture, scratch, validator};
+use common::{assert_no_new_issues, assert_records_extended, cloud, convert, copc, fixture, scratch, validator};
+use copc_compare::splice::Splice;
 
 fn field(name: &str, scale: f64) -> ScaledField {
     ScaledField::new(name, "C2C dist m; >max = 5*max", scale).unwrap()
@@ -37,9 +38,12 @@ fn extra_bytes_via_copc_reader(path: &std::path::Path) -> Vec<Vec<u8>> {
 #[test]
 fn constant_field() {
     let a = CopcFile::open(&fixture("untwine_reference.copc.laz")).unwrap();
+    // Untwine's chunks (lazperf) have the layout the splice expects.
+    let s = Splice::new(&a, 4).unwrap();
+    assert!(a.data_entries().all(|e| s.fits(a.compressed(e))));
     let out = scratch("constant.copc.laz");
     let fields = [field("c2c_dist", 0.001)];
-    passthrough(&a, &out, &fields, |_, c| vec![12; c.point_count()]).unwrap();
+    passthrough(&a, &out, &fields, false, |_, c| vec![12; c.point_count()]).unwrap();
 
     assert_no_new_issues(&a.path, &out);
     let o = CopcFile::open(&out).unwrap();
@@ -84,7 +88,7 @@ fn constant_field() {
 fn reencode_without_fields_is_lossless() {
     let a = CopcFile::open(&fixture("untwine_reference.copc.laz")).unwrap();
     let out = scratch("nofields.copc.laz");
-    passthrough(&a, &out, &[], |_, _| Vec::new()).unwrap();
+    passthrough(&a, &out, &[], true, |_, _| Vec::new()).unwrap();
     assert_no_new_issues(&a.path, &out);
     let o = CopcFile::open(&out).unwrap();
     assert_records_extended(&a, &o, |_, _| Vec::new());
@@ -110,7 +114,7 @@ fn existing_extra_bytes_and_offset_evlr() {
 
     let out = scratch("eb_output.copc.laz");
     let fields = [field("c2c_dist", 0.001), field("c2c_dz", 0.01)];
-    passthrough(&a, &out, &fields, |e, c| {
+    passthrough(&a, &out, &fields, false, |e, c| {
         (0..c.point_count()).flat_map(|i| [value(&e.key, i, 0), value(&e.key, i, 1)]).collect()
     })
     .unwrap();
@@ -135,3 +139,48 @@ fn existing_extra_bytes_and_offset_evlr() {
     assert!(eb.iter().all(|b| b.len() == a.las_header().point_format().extra_bytes as usize + 8));
 }
 
+/// `n` fields of varied values, as the passthrough's `values` closure.
+fn values_for(n: usize) -> impl Fn(&copc_streaming::HierarchyEntry, &copc_streaming::Chunk) -> Vec<i32> + Sync {
+    move |e, c| (0..c.point_count()).flat_map(|i| (0..n).map(move |f| value(&e.key, i, f))).collect::<Vec<_>>()
+}
+
+#[test]
+fn splice_equals_reencode() {
+    // Random scanner channels on every point: the LAZ contexts switch all the
+    // time, also back to channels seen before. A's chunks are laz-rs's (via
+    // copc-converter), so a full re-encode reproduces them and splicing must
+    // give byte-identical files, here and on top of existing extra bytes.
+    let pts = cloud(7, 40_000);
+    for format in [6, 7, 8] {
+        let a_path = copc(&format!("splice_pf{format}"), format, [0.001; 3], [0.0; 3], &pts);
+        let a = CopcFile::open(&a_path).unwrap();
+        let mut a2_path = None;
+        for n in [1, 3] {
+            let fields: Vec<ScaledField> = (0..n).map(|i| field(&format!("f{i}"), 0.001)).collect();
+            let (sp, re) = (scratch(&format!("splice_pf{format}_{n}.copc.laz")), scratch(&format!("reenc_pf{format}_{n}.copc.laz")));
+            passthrough(&a, &sp, &fields, false, values_for(n)).unwrap();
+            passthrough(&a, &re, &fields, true, values_for(n)).unwrap();
+            let o = CopcFile::open(&sp).unwrap();
+            let s = Splice::new(&a, 4 * n).unwrap();
+            assert!(a.data_entries().all(|e| s.fits(a.compressed(e))), "PF{format}: every chunk spliced");
+            assert!(std::fs::read(&sp).unwrap() == std::fs::read(&re).unwrap(), "PF{format}, {n} fields: files differ");
+            assert_records_extended(&a, &o, |k, i| (0..n).map(|f| value(k, i, f)).collect());
+            a2_path = Some(sp);
+        }
+
+        // A with 12 extra bytes of its own (laz-rs encoded): 2 more fields.
+        let a2 = CopcFile::open(a2_path.as_ref().unwrap()).unwrap();
+        Splice::new(&a2, 8).unwrap();
+        let fields = [field("g0", 0.01), field("g1", 0.01)];
+        let (sp, re) = (scratch(&format!("splice2_pf{format}.copc.laz")), scratch(&format!("reenc2_pf{format}.copc.laz")));
+        let shifted = |e: &copc_streaming::HierarchyEntry, c: &copc_streaming::Chunk| {
+            (0..c.point_count()).flat_map(|i| [value(&e.key, i, 5), value(&e.key, i, 6)]).collect()
+        };
+        passthrough(&a2, &sp, &fields, false, shifted).unwrap();
+        passthrough(&a2, &re, &fields, true, shifted).unwrap();
+        assert!(std::fs::read(&sp).unwrap() == std::fs::read(&re).unwrap(), "PF{format} on extra bytes: files differ");
+        validator::assert_valid_copc(&sp);
+        let o = CopcFile::open(&sp).unwrap();
+        assert_records_extended(&a2, &o, |k, i| vec![value(k, i, 5), value(k, i, 6)]);
+    }
+}

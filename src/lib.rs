@@ -7,5 +7,6 @@ pub mod extra_bytes;
 pub mod info;
 pub mod input;
 pub mod pipeline;
+pub mod splice;
 pub mod tiles;
 pub mod write;

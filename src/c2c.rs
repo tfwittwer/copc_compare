@@ -60,6 +60,7 @@ pub fn default_scale(coordinate_scales: &[f64]) -> f64 {
     coordinate_scales.iter().copied().fold(f64::INFINITY, f64::min).max(MIN_DEFAULT_SCALE)
 }
 
+#[derive(Clone, Debug)]
 pub struct Options {
     /// Neighbours farther than this count as "none"; also the tile buffer.
     pub max_dist: f64,
@@ -77,6 +78,8 @@ pub struct Options {
     pub force: bool,
     /// Draw a progress bar (only shown on a terminal).
     pub progress: bool,
+    /// Re-encode A's chunks even where they could be spliced (for comparisons).
+    pub reencode: bool,
 }
 
 impl Options {
@@ -91,6 +94,7 @@ impl Options {
             tiles_in_flight: 8,
             force: false,
             progress: false,
+            reencode: false,
         }
     }
 }
@@ -169,6 +173,8 @@ pub struct Stats {
     pub b_in_trees: u64,
     pub max_b_in_tile: u64,
     pub tiles_run: usize,
+    /// A's chunks spliced rather than re-encoded.
+    pub spliced: u64,
     /// (min, max) raw value per output field.
     pub ranges: Vec<(i32, i32)>,
     /// Wall time summed over tiles: reference decode, kd-tree build, compared
@@ -195,6 +201,7 @@ impl Stats {
         self.b_in_trees += o.b_in_trees;
         self.max_b_in_tile = self.max_b_in_tile.max(o.max_b_in_tile);
         self.tiles_run += o.tiles_run;
+        self.spliced += o.spliced;
         for (r, o) in self.ranges.iter_mut().zip(&o.ranges) {
             *r = (r.0.min(o.0), r.1.max(o.1));
         }
@@ -535,15 +542,17 @@ impl Ctx<'_> {
         let encoded: Vec<(NodeChunk, Stats)> = owned
             .par_iter()
             .map(|e| {
-                let c = self.a.decode(e, Fields::ALL)?;
+                let compressed = self.a.compressed(e);
+                let c = self.a.decode(e, self.record.decode_fields(compressed))?;
                 let mut s = Stats::new(nf);
                 let mut vals = vec![0; c.point_count() * nf];
-                for (p, out) in c.positions().expect("decoded with ALL").zip(vals.chunks_exact_mut(nf)) {
+                for (p, out) in c.positions().expect("decoded with Z").zip(vals.chunks_exact_mut(nf)) {
                     let m = self.measure(&nb, p, out);
                     s.add(out, m);
                     s.outside_tile += u64::from(!contains(&inside, p));
                 }
-                let bytes = self.record.encode(c.cloud().raw_bytes(), &vals)?;
+                s.spliced = u64::from(self.record.splices(compressed));
+                let bytes = self.record.encode(compressed, &c, &vals)?;
                 Ok(((e.key, e.point_count, bytes), s))
             })
             .collect::<Result<_>>()?;
@@ -602,19 +611,27 @@ pub fn run(a: &CopcFile, b: &CopcFile, out: &Path, opt: &Options) -> Result<Summ
     let tile_points = opt.tile_points.min(balanced);
     let cut = Cut::new(a, Some(b), tile_points, 4.0 * opt.max_dist);
 
+    let mut writer = CopcWriter::create(out, a, &fields)?;
+    let mut record = writer.layout().clone();
+    if opt.reencode {
+        record = record.reencoding();
+    }
+
     // Shared nodes: decode once, assign each point to the tile that contains it.
-    let shared_chunks = cut.shared.par_iter().map(|e| a.decode(e, Fields::ALL)).collect::<Result<Vec<_>>>()?;
+    let shared_chunks = cut
+        .shared
+        .par_iter()
+        .map(|e| a.decode(e, record.decode_fields(a.compressed(e))))
+        .collect::<Result<Vec<_>>>()?;
     let mut shared_by_tile: Vec<Vec<SharedPoint>> = (0..cut.tiles.len()).map(|_| Vec::new()).collect();
     for (node, c) in shared_chunks.iter().enumerate() {
-        for (index, pos) in c.positions().expect("decoded with ALL").enumerate() {
+        for (index, pos) in c.positions().expect("decoded with Z").enumerate() {
             shared_by_tile[cut.locate(pos)].push(SharedPoint { node: node as u32, index: index as u32, pos });
         }
     }
     let mut shared_values: Vec<Vec<i32>> = shared_chunks.iter().map(|c| vec![cap; c.point_count() * nf]).collect();
     let t_setup = t0.elapsed();
 
-    let mut writer = CopcWriter::create(out, a, &fields)?;
-    let record = writer.layout().clone();
     let ctx = Ctx {
         a,
         b,
@@ -664,11 +681,11 @@ pub fn run(a: &CopcFile, b: &CopcFile, out: &Path, opt: &Options) -> Result<Summ
     bar.finish_and_clear();
     let t_tiles = t0.elapsed();
 
-    let shared_encoded: Vec<Vec<u8>> = shared_chunks
-        .par_iter()
-        .zip(&shared_values)
-        .map(|(c, v)| record.encode(c.cloud().raw_bytes(), v))
+    let shared_encoded: Vec<Vec<u8>> = (&cut.shared, &shared_chunks, &shared_values)
+        .into_par_iter()
+        .map(|(e, c, v)| record.encode(a.compressed(e), c, v))
         .collect::<Result<_>>()?;
+    stats.spliced += cut.shared.iter().filter(|e| record.splices(a.compressed(e))).count() as u64;
     for (e, bytes) in cut.shared.iter().zip(&shared_encoded) {
         writer.write_chunk(e.key, e.point_count, bytes)?;
     }
@@ -704,7 +721,7 @@ pub fn run(a: &CopcFile, b: &CopcFile, out: &Path, opt: &Options) -> Result<Summ
          beyond max-dist: {} ({:.2} %)\n  \
          time: setup {:.2} s, tiles {:.2} s, shared + finish {:.2} s, total {secs:.2} s = {:.1} M pts/s\n  \
          tile time (summed): reference decode {:.1} s, kd-tree {:.1} s, compared {:.1} s; slowest tile {:.1} s\n  \
-         output {:.1} MB ({:+.3} B/pt vs compared file)",
+         output {:.1} MB ({:+.3} B/pt vs compared file), {} of {} compared chunks spliced",
         a.path.display(),
         out.display(),
         names.join(", "),
@@ -735,6 +752,8 @@ pub fn run(a: &CopcFile, b: &CopcFile, out: &Path, opt: &Options) -> Result<Summ
         stats.secs_max_tile,
         written.bytes as f64 / 1e6,
         (written.bytes as f64 - a.file_size() as f64) / n.max(1.0),
+        stats.spliced,
+        written.chunks,
     );
     Ok(Summary { stats, tiles: cut.tiles.len(), scale, b_points, fields: names })
 }

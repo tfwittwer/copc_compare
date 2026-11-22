@@ -10,7 +10,7 @@
 //! A's other VLRs, verbatim
 //! VLR LASF_Spec/4                       A's descriptors + ours
 //! i64 offset of the chunk table         patched at the end
-//! chunks, in arrival order
+//! chunks, in arrival order              A's, spliced (see `splice`), or re-encoded
 //! LAZ chunk table
 //! EVLR copc/1000                        hierarchy pages, A's keys (root page first)
 //! A's LASF_Projection / LASF_Spec EVLRs, verbatim
@@ -23,13 +23,14 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail, ensure};
-use copc_streaming::VoxelKey;
+use copc_streaming::{Chunk, Fields, VoxelKey};
 use laz::laszip::{ChunkTable, ChunkTableEntry};
 use laz::record::{LayeredPointRecordCompressor, RecordCompressor};
 use laz::{LazVlr, LazVlrBuilder};
 
 use crate::extra_bytes::{self, ScaledField};
 use crate::input::{CopcFile, RawVlr, key_tuple, las_str};
+use crate::splice::Splice;
 
 const HEADER_SIZE: u16 = 375;
 const VLR_HEADER_SIZE: u64 = RawVlr::HEADER_SIZE;
@@ -44,6 +45,8 @@ pub struct RecordLayout {
     pub laz_vlr: LazVlr,
     pub in_len: usize,
     pub n_fields: usize,
+    /// How A's chunks are spliced; `None` re-encodes them.
+    splice: Option<Splice>,
 }
 
 impl RecordLayout {
@@ -51,9 +54,28 @@ impl RecordLayout {
         self.in_len + self.n_fields * ScaledField::BYTES
     }
 
-    /// Append `values` (point-major, `n_fields` per point) to A's raw records and
-    /// LAZ-compress the result as one COPC chunk.
-    pub fn encode(&self, raw: &[u8], values: &[i32]) -> Result<Vec<u8>> {
+    /// Re-encode every chunk, also those that could be spliced (for comparisons).
+    pub fn reencoding(mut self) -> Self {
+        self.splice = None;
+        self
+    }
+
+    /// Whether A's chunk `compressed` will be spliced rather than re-encoded.
+    pub fn splices(&self, compressed: &[u8]) -> bool {
+        self.splice.as_ref().is_some_and(|s| s.fits(compressed))
+    }
+
+    /// The fields to decode A's chunk `compressed` with for [`Self::encode`]:
+    /// positions and scanner channel (`Fields::Z`) if it is spliced, else all.
+    pub fn decode_fields(&self, compressed: &[u8]) -> Fields {
+        if self.splices(compressed) { Fields::Z } else { Fields::ALL }
+    }
+
+    /// The output chunk of one of A's nodes: `compressed` is A's chunk, `chunk`
+    /// that decoded with [`Self::decode_fields`], `values` the new fields
+    /// (point-major, `n_fields` per point).
+    pub fn encode(&self, compressed: &[u8], chunk: &Chunk, values: &[i32]) -> Result<Vec<u8>> {
+        let raw = chunk.cloud().raw_bytes();
         ensure!(raw.len().is_multiple_of(self.in_len), "raw records not a multiple of {}", self.in_len);
         let n = raw.len() / self.in_len;
         ensure!(
@@ -62,6 +84,11 @@ impl RecordLayout {
             values.len(),
             self.n_fields
         );
+        if let Some(s) = self.splice.as_ref().filter(|s| s.fits(compressed)) {
+            let extra: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+            return s.splice(compressed, raw, &extra);
+        }
+        ensure!(chunk.fields.contains(Fields::ALL), "re-encoding a chunk decoded without all fields");
         let mut buf = Vec::with_capacity(n * self.out_len());
         if self.n_fields == 0 {
             buf.extend_from_slice(raw);
@@ -251,6 +278,10 @@ impl CopcWriter {
             gpstime_max: ci.gpstime_maximum,
         };
 
+        let splice = Splice::new(a, fields.len() * ScaledField::BYTES)
+            .map_err(|why| eprintln!("note: re-encoding the chunks of {}, can't splice them: {why}", a.path.display()))
+            .ok();
+
         let file = File::create(path).with_context(|| format!("creating {}", path.display()))?;
         let mut w = BufWriter::with_capacity(8 << 20, file);
         header.write_to(&mut w)?;
@@ -268,7 +299,7 @@ impl CopcWriter {
             pos,
             header,
             copc_info,
-            layout: RecordLayout { laz_vlr, in_len, n_fields: fields.len() },
+            layout: RecordLayout { laz_vlr, in_len, n_fields: fields.len(), splice },
             chunk_table: ChunkTable::default(),
             written: HashMap::new(),
             kept_evlrs,

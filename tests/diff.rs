@@ -3,70 +3,13 @@
 
 mod common;
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-use common::{convert, fixture, read_back, scratch, write_las_points};
+use common::{cloud, convert, copc, fixture, point, read_back, rng, scratch};
 use copc_compare::c2c;
 use copc_compare::diff::{self, Options, Report};
 use copc_compare::input::CopcFile;
-use las::point::{Classification, ScanDirection};
-
-
-fn rng(mut s: u64) -> impl FnMut() -> u64 {
-    move || {
-        s = s.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = s;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^ (z >> 31)
-    }
-}
-
-/// A point on the mm grid in a 100 × 100 × 10 m box, every field random.
-fn point(i: usize, r: &mut impl FnMut() -> u64) -> las::Point {
-    let mut mm = |range: u64| (r() % range) as f64 * 0.001;
-    let (x, y, z) = (1000.0 + mm(100_000), 2000.0 + mm(100_000), mm(10_000));
-    las::Point {
-        x,
-        y,
-        z,
-        intensity: r() as u16,
-        return_number: 1 + (r() % 3) as u8,
-        number_of_returns: 3,
-        classification: Classification::new((r() % 10) as u8).unwrap(),
-        scanner_channel: (r() % 4) as u8,
-        is_synthetic: r().is_multiple_of(3),
-        is_key_point: r().is_multiple_of(11),
-        is_withheld: r().is_multiple_of(7),
-        is_overlap: r().is_multiple_of(5),
-        scan_direction: if r().is_multiple_of(2) { ScanDirection::RightToLeft } else { ScanDirection::LeftToRight },
-        is_edge_of_flight_line: r().is_multiple_of(13),
-        scan_angle: ((r() % 2000) as f32 - 1000.0) * 0.006,
-        user_data: r() as u8,
-        point_source_id: (r() % 100) as u16,
-        gps_time: Some(i as f64 * 0.5),
-        color: Some(las::Color { red: r() as u16, green: r() as u16, blue: r() as u16 }),
-        ..Default::default()
-    }
-}
-
-fn cloud(seed: u64, n: usize) -> Vec<las::Point> {
-    let mut r = rng(seed);
-    (0..n).map(|i| point(i, &mut r)).collect()
-}
-
-/// Write `points` as LAS and convert to COPC.
-fn copc(name: &str, format: u8, scale: [f64; 3], offset: [f64; 3], points: &[las::Point]) -> PathBuf {
-    let las = scratch(&format!("{name}.las"));
-    let mut points = points.to_vec();
-    if format == 6 {
-        points.iter_mut().for_each(|p| p.color = None);
-    }
-    write_las_points(&las, format, scale, offset, &points);
-    let out = scratch(&format!("{name}.copc.laz"));
-    convert(&[las], &out, None);
-    out
-}
+use las::point::Classification;
 
 fn run(x: &Path, y: &Path, opt: Options) -> Report {
     let (x, y) = (CopcFile::open(x).unwrap(), CopcFile::open(y).unwrap());
