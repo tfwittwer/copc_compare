@@ -1,6 +1,6 @@
 //! Distribution of the c2c output values over the points with a neighbour
-//! within max-dist: count, min, max, mean and standard deviation, exact from
-//! integer sums of the raw values, and the median from a histogram of them.
+//! within max-dist: count, min, max, mean, standard deviation and RMS, exact
+//! from integer sums of the raw values, and the median from a histogram of them.
 
 use std::fmt::Write;
 
@@ -39,8 +39,10 @@ pub struct FieldSummary {
     pub max: f64,
     pub mean: f64,
     pub median: f64,
-    /// Population standard deviation.
+    /// Population standard deviation (spread around the mean).
     pub stddev: f64,
+    /// Root mean square (spread around 0): `sqrt(mean² + stddev²)`.
+    pub rms: f64,
     /// How far the median may be off: 0 with one histogram bin per raw value.
     pub median_error: f64,
 }
@@ -145,6 +147,7 @@ impl Distribution {
                     mean: f.sum as f64 / n * scale,
                     median: median * scale,
                     stddev: var.sqrt() * scale,
+                    rms: (f.sum_sq as f64 / n).sqrt() * scale,
                     median_error: if width == 1 { 0.0 } else { width as f64 / 2.0 * scale },
                 })
             })
@@ -153,20 +156,20 @@ impl Distribution {
 }
 
 /// The distribution as a table, one row per field: min and max with as many
-/// decimals as `scale` has, mean, median and stddev with one more (they fall
-/// between the steps, and a small mean offset is often the point).
+/// decimals as `scale` has, mean, median, stddev and RMS with one more (they
+/// fall between the steps, and a small mean offset is often the point).
 pub fn table(names: &[String], summaries: &[Option<FieldSummary>], scale: f64) -> String {
     let decimals = (-scale.log10() - 1e-9).ceil().clamp(0.0, 9.0) as usize;
-    let header = ["field", "min", "max", "mean", "median", "stddev"];
-    let mut rows: Vec<[String; 6]> = vec![header.map(String::from)];
+    let header = ["field", "min", "max", "mean", "median", "stddev", "rms"];
+    let mut rows: Vec<[String; 7]> = vec![header.map(String::from)];
     for (name, s) in names.iter().zip(summaries) {
         let (v, w) = (|x: f64| format!("{x:.decimals$}"), |x: f64| format!("{x:.0$}", decimals + 1));
         rows.push(match s {
-            Some(s) => [name.clone(), v(s.min), v(s.max), w(s.mean), w(s.median), w(s.stddev)],
-            None => [name.clone(), "-".into(), "-".into(), "-".into(), "-".into(), "-".into()],
+            Some(s) => [name.clone(), v(s.min), v(s.max), w(s.mean), w(s.median), w(s.stddev), w(s.rms)],
+            None => std::array::from_fn(|c| if c == 0 { name.clone() } else { "-".into() }),
         });
     }
-    let widths: Vec<usize> = (0..6).map(|c| rows.iter().map(|r| r[c].len()).max().unwrap_or(0)).collect();
+    let widths: Vec<usize> = (0..header.len()).map(|c| rows.iter().map(|r| r[c].len()).max().unwrap_or(0)).collect();
     let mut out = String::new();
     for r in &rows {
         let _ = write!(out, "    {:<w$}", r[0], w = widths[0]);
@@ -199,6 +202,8 @@ mod tests {
         assert_eq!((a.n, a.min, a.max, a.median, a.median_error), (4, 0.5, 2.0, 1.25, 0.0));
         assert!((a.mean - 1.25).abs() < 1e-12);
         assert!((a.stddev - 0.5 * 1.25f64.sqrt()).abs() < 1e-12);
+        assert!((a.rms - 0.5 * 7.5f64.sqrt()).abs() < 1e-12); // sqrt((1 + 4 + 9 + 16) / 4) raw
+        assert!((s[1].as_ref().unwrap().rms - 0.5 * 8.25f64.sqrt()).abs() < 1e-12); // sqrt((16 + 0 + 16 + 1) / 4) raw
         let b = s[1].as_ref().unwrap();
         assert_eq!((b.min, b.max, b.median), (-2.0, 2.0, -0.25));
         assert!(Distribution::new(1, 10).summaries(1.0)[0].is_none());
@@ -218,11 +223,11 @@ mod tests {
 
     #[test]
     fn table_aligns_columns() {
-        let s = FieldSummary { n: 3, min: -0.25, max: 1.0, mean: 0.125, median: 0.0, stddev: 0.5, median_error: 0.0 };
+        let s = FieldSummary { n: 3, min: -0.25, max: 1.0, mean: 0.125, median: 0.0, stddev: 0.5, rms: 0.515, median_error: 0.0 };
         let t = table(&["c2c_dist".into(), "c2c_dz".into()], &[Some(s), None], 0.001);
         let lines: Vec<&str> = t.lines().collect();
-        assert_eq!(lines[0], "    field        min    max    mean  median  stddev");
-        assert_eq!(lines[1], "    c2c_dist  -0.250  1.000  0.1250  0.0000  0.5000");
-        assert_eq!(lines[2], "    c2c_dz         -      -       -       -       -");
+        assert_eq!(lines[0], "    field        min    max    mean  median  stddev     rms");
+        assert_eq!(lines[1], "    c2c_dist  -0.250  1.000  0.1250  0.0000  0.5000  0.5150");
+        assert_eq!(lines[2], "    c2c_dz         -      -       -       -       -       -");
     }
 }

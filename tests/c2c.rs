@@ -393,7 +393,7 @@ fn splice_equals_reencode() {
 #[test]
 fn distribution_matches_read_back() {
     // The statistics printed after a run equal those of the values read back,
-    // computed independently (sorted median, two-pass variance).
+    // computed independently (sorted median, two-pass variance, RMS).
     let a = copc("dist_a", 6, [0.001; 3], [0.0; 3], &cloud(21, 30_000));
     let b = copc("dist_b", 6, [0.001; 3], [0.0; 3], &cloud(22, 30_000));
     let out = scratch("dist_out.copc.laz");
@@ -417,6 +417,8 @@ fn distribution_matches_read_back() {
         assert_eq!((got.min, got.max, got.median), (x[0] as f64 * sc, x[n - 1] as f64 * sc, median * sc), "field {f}");
         assert!((got.mean - mean * sc).abs() < 1e-12, "field {f}: mean {} vs {}", got.mean, mean * sc);
         assert!((got.stddev - var.sqrt() * sc).abs() < 1e-9, "field {f}: stddev {} vs {}", got.stddev, var.sqrt() * sc);
+        let rms = (x.iter().map(|&v| (v as f64).powi(2)).sum::<f64>() / n as f64).sqrt() * sc;
+        assert!((got.rms - rms).abs() < 1e-9, "field {f}: rms {} vs {rms}", got.rms);
         assert_eq!(got.median_error, 0.0);
     }
 }

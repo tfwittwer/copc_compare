@@ -80,21 +80,23 @@ over the points that have a reference neighbour within max-dist. For example, wi
 
 ```
   distribution over the 37536765 points with a neighbour within 1 m, in m:
-    field         min    max     mean  median  stddev
-    c2c_dist    0.000  1.000   0.1876  0.0880  0.2233
-    c2c_dx     -0.996  0.995  -0.0021  0.0000  0.1930
-    c2c_dy     -0.997  0.999   0.0003  0.0000  0.2029
-    c2c_dz     -0.953  0.965   0.0008  0.0000  0.0814
-    c2c_plane  -0.998  1.000   0.0012  0.0000  0.2776
+    field         min    max     mean  median  stddev     rms
+    c2c_dist    0.000  1.000   0.1876  0.0880  0.2233  0.2916
+    c2c_dx     -0.996  0.995  -0.0021  0.0000  0.1930  0.1930
+    c2c_dy     -0.997  0.999   0.0003  0.0000  0.2029  0.2029
+    c2c_dz     -0.953  0.965   0.0008  0.0000  0.0814  0.0814
+    c2c_plane  -0.998  1.000   0.0012  0.0000  0.2776  0.2776
 ```
 
-- **Exact:** count, min, max, mean and stddev (population) come from integer sums
-  of the stored values.
+- **Exact:** count, min, max, mean, stddev and RMS come from integer sums of the
+  stored values. Stddev is the population spread around the mean. RMS is the
+  spread around zero, √(mean² + stddev²): the usual figure for the overall size
+  of the differences.
 - **Median:** taken from a histogram of the stored values. It's exact up to
   max-dist = 32767 × scale (3.2 m at 0.1 mm); beyond that the table states how
   precise it is.
-- **Decimals:** mean, median and stddev get one decimal more than the scale, so
-  small systematic offsets show.
+- **Decimals:** mean, median, stddev and RMS get one decimal more than the scale,
+  so small systematic offsets show.
 
 ### How it works
 
