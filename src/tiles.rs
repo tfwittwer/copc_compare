@@ -14,6 +14,9 @@
 //! A data node is *owned* by the tile at or above it, or *shared* if it lies above
 //! the cut (a strict ancestor of tiles). Shared points are assigned to tiles by
 //! position.
+//!
+//! [`Cut::covering`] is the variant for `diff`: a cube covering several files,
+//! sized by all their points, every point assigned by position.
 
 use std::collections::HashMap;
 
@@ -40,50 +43,20 @@ impl Cut {
     /// `max_points` too.
     pub fn new(a: &CopcFile, b: Option<&CopcFile>, max_points: u64, min_side: f64) -> Self {
         let root = a.root_bounds();
-        let side0 = root.max[0] - root.min[0];
         // Points per subtree: (compared, reference).
         let mut subtree: HashMap<Key, (u64, u64)> = HashMap::new();
-        let mut add = |key: VoxelKey, n: u64, is_b: bool| {
-            let mut k = Some(key);
-            while let Some(key) = k {
-                let s = subtree.entry(key_tuple(&key)).or_default();
-                if is_b { s.1 += n } else { s.0 += n }
-                k = key.parent();
-            }
-        };
         for e in a.data_entries() {
-            add(e.key, u64::from(e.point_count), false);
+            add(&mut subtree, e.key, u64::from(e.point_count), false);
         }
         if let Some(b) = b {
             let b_root = b.root_bounds();
             for e in b.data_entries() {
-                let bb = e.key.bounds(&b_root);
-                let c: [f64; 3] = std::array::from_fn(|i| 0.5 * (bb.min[i] + bb.max[i]));
-                if !contains(&root, c) {
-                    continue;
+                if let Some(k) = attribute(&root, &e.key.bounds(&b_root)) {
+                    add(&mut subtree, k, u64::from(e.point_count), true);
                 }
-                let b_side = bb.max[0] - bb.min[0];
-                let level = ((side0 / b_side).log2().floor().max(0.0) as i32).min(30);
-                let n = 1i64 << level;
-                let k: [i32; 3] = std::array::from_fn(|i| {
-                    (((c[i] - root.min[i]) / (side0 / n as f64)).floor() as i64).clamp(0, n - 1) as i32
-                });
-                add(VoxelKey { level, x: k[0], y: k[1], z: k[2] }, u64::from(e.point_count), true);
             }
         }
-
-        let mut tiles = Vec::new();
-        let mut stack = vec![VoxelKey::ROOT];
-        while let Some(k) = stack.pop() {
-            let (sa, sb) = subtree.get(&key_tuple(&k)).copied().unwrap_or((0, 0));
-            let child_side = side0 / f64::from(1u32 << (k.level + 1));
-            if sa == 0 || sa + sb <= max_points || child_side < min_side || k.level >= 30 {
-                tiles.push(k);
-            } else {
-                // Reversed, so octant 0 is popped (visited) first.
-                stack.extend(k.children().into_iter().rev());
-            }
-        }
+        let tiles = split(&root, &subtree, max_points, min_side);
 
         let index: HashMap<Key, usize> = tiles.iter().enumerate().map(|(i, k)| (key_tuple(k), i)).collect();
         let mut owned = vec![Vec::new(); tiles.len()];
@@ -108,15 +81,60 @@ impl Cut {
         Self { tiles, owned, shared, index, deepest, root }
     }
 
+    /// A cut over the smallest cube (from the low corner) that holds every
+    /// file's root cube, sized by all their points, with every node attributed
+    /// by its centre. No point is outside the cube unless it lies outside its
+    /// own file's root cube. `owned` and `shared` are left empty: for callers
+    /// that assign every point by position.
+    pub fn covering(files: &[&CopcFile], max_points: u64) -> Self {
+        let roots: Vec<Aabb> = files.iter().map(|f| f.root_bounds()).collect();
+        let min: [f64; 3] = std::array::from_fn(|a| roots.iter().map(|r| r.min[a]).fold(f64::INFINITY, f64::min));
+        let side = (0..3)
+            .map(|a| roots.iter().map(|r| r.max[a]).fold(f64::NEG_INFINITY, f64::max) - min[a])
+            .fold(0.0, f64::max);
+        let root = Aabb { min, max: min.map(|v| v + side) };
+        let mut subtree: HashMap<Key, (u64, u64)> = HashMap::new();
+        for (f, fr) in files.iter().zip(&roots) {
+            for e in f.data_entries() {
+                if let Some(k) = attribute(&root, &e.key.bounds(fr)) {
+                    add(&mut subtree, k, u64::from(e.point_count), false);
+                }
+            }
+        }
+        let tiles = split(&root, &subtree, max_points, 0.0);
+        let index: HashMap<Key, usize> = tiles.iter().enumerate().map(|(i, k)| (key_tuple(k), i)).collect();
+        let deepest = tiles.iter().map(|k| k.level).max().unwrap_or(0);
+        Self { owned: vec![Vec::new(); tiles.len()], shared: Vec::new(), tiles, index, deepest, root }
+    }
+
     /// The tile that contains `p`. Points outside the root cube go to the nearest
     /// boundary tile.
     pub fn locate(&self, p: [f64; 3]) -> usize {
-        // One key at the deepest tile level, shifted for coarser levels, so the
-        // descent is consistent even for points on cell boundaries.
+        self.lookup(self.fine_key(p))
+    }
+
+    /// Like [`Cut::locate`], but checks tile `hint` first: cheap when
+    /// consecutive points tend to share a tile.
+    pub fn locate_near(&self, p: [f64; 3], hint: usize) -> usize {
+        let fine = self.fine_key(p);
+        let k = &self.tiles[hint];
+        let sh = self.deepest - k.level;
+        if (fine[0] >> sh) as i32 == k.x && (fine[1] >> sh) as i32 == k.y && (fine[2] >> sh) as i32 == k.z {
+            // Tiles partition the cube, so the only tile with this prefix.
+            return hint;
+        }
+        self.lookup(fine)
+    }
+
+    /// One key at the deepest tile level, shifted for coarser levels, so the
+    /// descent is consistent even for points on cell boundaries.
+    fn fine_key(&self, p: [f64; 3]) -> [i64; 3] {
         let n = 1i64 << self.deepest;
         let side = (self.root.max[0] - self.root.min[0]) / n as f64;
-        let fine: [i64; 3] =
-            std::array::from_fn(|a| (((p[a] - self.root.min[a]) / side).floor() as i64).clamp(0, n - 1));
+        std::array::from_fn(|a| (((p[a] - self.root.min[a]) / side).floor() as i64).clamp(0, n - 1))
+    }
+
+    fn lookup(&self, fine: [i64; 3]) -> usize {
         for level in 0..=self.deepest {
             let sh = self.deepest - level;
             let key = (level, (fine[0] >> sh) as i32, (fine[1] >> sh) as i32, (fine[2] >> sh) as i32);
@@ -130,6 +148,53 @@ impl Cut {
     pub fn tile_bounds(&self, t: usize) -> Aabb {
         self.tiles[t].bounds(&self.root)
     }
+}
+
+/// Add `n` points at `key` to the subtree counts of it and its ancestors
+/// (`.0` for compared, `.1` for reference points).
+fn add(subtree: &mut HashMap<Key, (u64, u64)>, key: VoxelKey, n: u64, is_b: bool) {
+    let mut k = Some(key);
+    while let Some(key) = k {
+        let s = subtree.entry(key_tuple(&key)).or_default();
+        if is_b { s.1 += n } else { s.0 += n }
+        k = key.parent();
+    }
+}
+
+/// The key of `root`'s octree that contains the centre of node bounds `b`, at
+/// the finest level at least as wide as the node; `None` if the centre is
+/// outside `root`.
+fn attribute(root: &Aabb, b: &Aabb) -> Option<VoxelKey> {
+    let side0 = root.max[0] - root.min[0];
+    let c: [f64; 3] = std::array::from_fn(|i| 0.5 * (b.min[i] + b.max[i]));
+    if !contains(root, c) {
+        return None;
+    }
+    let level = ((side0 / (b.max[0] - b.min[0])).log2().floor().max(0.0) as i32).min(30);
+    let n = 1i64 << level;
+    let k: [i32; 3] =
+        std::array::from_fn(|i| (((c[i] - root.min[i]) / (side0 / n as f64)).floor() as i64).clamp(0, n - 1) as i32);
+    Some(VoxelKey { level, x: k[0], y: k[1], z: k[2] })
+}
+
+/// Recurse from the root: a node is a tile if its subtree holds no compared
+/// points, or at most `max_points` points, or if its children would be narrower
+/// than `min_side`. Tiles in Morton order.
+fn split(root: &Aabb, subtree: &HashMap<Key, (u64, u64)>, max_points: u64, min_side: f64) -> Vec<VoxelKey> {
+    let side0 = root.max[0] - root.min[0];
+    let mut tiles = Vec::new();
+    let mut stack = vec![VoxelKey::ROOT];
+    while let Some(k) = stack.pop() {
+        let (sa, sb) = subtree.get(&key_tuple(&k)).copied().unwrap_or((0, 0));
+        let child_side = side0 / f64::from(1u32 << (k.level + 1));
+        if sa == 0 || sa + sb <= max_points || child_side < min_side || k.level >= 30 {
+            tiles.push(k);
+        } else {
+            // Reversed, so octant 0 is popped (visited) first.
+            stack.extend(k.children().into_iter().rev());
+        }
+    }
+    tiles
 }
 
 /// `b` grown by `d` on every side.
@@ -171,5 +236,12 @@ mod tests {
         assert_eq!(c.tiles[c.locate([8.0, 8.0, 8.0])], VoxelKey { level: 1, x: 1, y: 1, z: 1 });
         assert_eq!(c.tiles[c.locate([-0.001, 0.0, 0.0])], VoxelKey { level: 2, x: 0, y: 0, z: 0 });
         assert_eq!(c.tiles[c.locate([4.0, 0.0, 0.0])], VoxelKey { level: 1, x: 1, y: 0, z: 0 });
+
+        // A hint never changes the answer.
+        for p in [[0.5, 0.5, 0.5], [3.9, 2.1, 0.0], [5.0, 1.0, 1.0], [8.0, 8.0, 8.0], [-0.001, 0.0, 0.0], [4.0, 0.0, 0.0]] {
+            for hint in 0..c.tiles.len() {
+                assert_eq!(c.locate_near(p, hint), c.locate(p), "{p:?} hint {hint}");
+            }
+        }
     }
 }

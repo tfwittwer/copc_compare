@@ -193,6 +193,32 @@ impl CopcFile {
         usize::from(self.las_header().point_format().len())
     }
 
+    /// LAS point format id (6, 7 or 8, checked in `open`).
+    pub fn point_format(&self) -> u8 {
+        self.las_header().point_format().to_u8().expect("checked in open()")
+    }
+
+    /// Coordinate scale and offset per axis.
+    pub fn scale_offset(&self) -> ([f64; 3], [f64; 3]) {
+        let t = self.las_header().transforms();
+        ([t.x.scale, t.y.scale, t.z.scale], [t.x.offset, t.y.offset, t.z.offset])
+    }
+
+    /// The Extra Bytes VLR payload (descriptors), if any.
+    pub fn extra_bytes_vlr(&self) -> Option<&[u8]> {
+        self.vlrs.iter().find(|v| v.is("LASF_Spec", 4)).map(|v| &v.data[..])
+    }
+
+    /// The WKT CRS (VLR or EVLR LASF_Projection/2112), trailing NULs and
+    /// whitespace trimmed.
+    pub fn wkt(&self) -> Option<&[u8]> {
+        self.vlrs.iter().chain(&self.evlrs).find(|v| v.is("LASF_Projection", 2112)).map(|v| {
+            let d = &v.data[..];
+            let end = d.iter().rposition(|&c| c != 0 && !c.is_ascii_whitespace()).map_or(0, |i| i + 1);
+            &d[..end]
+        })
+    }
+
     /// All hierarchy entries (also empty ones), sorted by (level, x, y, z).
     pub fn entries(&self) -> &[HierarchyEntry] {
         &self.entries

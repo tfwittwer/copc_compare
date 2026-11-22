@@ -128,6 +128,20 @@ pub fn write_las(path: &Path, scale: f64, offset: [f64; 3], points: &[[f64; 3]])
     w.close().unwrap();
 }
 
+/// Write full `las::Point`s to an uncompressed LAS 1.4 file of point format
+/// `format`, with the given scale and offset per axis.
+pub fn write_las_points(path: &Path, format: u8, scale: [f64; 3], offset: [f64; 3], points: &[las::Point]) {
+    let mut b = las::Builder::from((1, 4));
+    b.point_format = las::point::Format::new(format).unwrap();
+    let t = |a: usize| las::Transform { scale: scale[a], offset: offset[a] };
+    b.transforms = las::Vector { x: t(0), y: t(1), z: t(2) };
+    let mut w = las::Writer::from_path(path, b.into_header().unwrap()).unwrap();
+    for p in points {
+        w.write_point(p.clone()).unwrap();
+    }
+    w.close().unwrap();
+}
+
 /// Points of a COPC file read through copc-reader: position and extra bytes.
 pub fn read_back(path: &Path) -> Vec<([f64; 3], Vec<u8>)> {
     let mut r = copc_reader::CopcReader::from_path(path).unwrap();

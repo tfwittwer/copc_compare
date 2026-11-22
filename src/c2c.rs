@@ -224,17 +224,8 @@ pub struct Summary {
     pub fields: Vec<String>,
 }
 
-/// The WKT CRS (VLR or EVLR LASF_Projection/2112), trailing NULs and whitespace trimmed.
-fn wkt(f: &CopcFile) -> Option<&[u8]> {
-    f.vlrs.iter().chain(&f.evlrs).find(|v| v.is("LASF_Projection", 2112)).map(|v| {
-        let d = &v.data[..];
-        let end = d.iter().rposition(|&c| c != 0 && !c.is_ascii_whitespace()).map_or(0, |i| i + 1);
-        &d[..end]
-    })
-}
-
 fn check_crs(a: &CopcFile, b: &CopcFile, force: bool) -> Result<()> {
-    match (wkt(a), wkt(b)) {
+    match (a.wkt(), b.wkt()) {
         (Some(wa), Some(wb)) if wa != wb => {
             let msg = format!(
                 "CRS differs between {} and {}:\n  {}\n  {}",

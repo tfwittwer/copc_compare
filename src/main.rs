@@ -1,10 +1,11 @@
 use std::path::PathBuf;
+use std::process::ExitCode;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
 use copc_compare::extra_bytes::ScaledField;
 use copc_compare::input::CopcFile;
-use copc_compare::{c2c, info, pipeline};
+use copc_compare::{c2c, diff, info, pipeline};
 
 #[derive(Parser)]
 #[command(version, about = "Cloud-to-cloud distances between COPC files, written out as COPC")]
@@ -69,6 +70,37 @@ enum Cmd {
         /// Tiles processed at once (overrides the memory-derived value).
         #[arg(long, hide = true)]
         tiles_in_flight: Option<usize>,
+    },
+    /// Whether two COPC files hold the same points, independent of point order
+    /// and octree. Compares the position and every field both files have, and
+    /// lists the points that differ. Exit status 0 if the point sets are
+    /// identical, 1 if not, 2 on error.
+    Diff {
+        x: PathBuf,
+        y: PathBuf,
+        /// Compare only these fields besides the position (comma-separated):
+        /// gps_time, intensity, returns, channel, flags, classification,
+        /// user_data, scan_angle, point_source_id, rgb, nir, extra bytes field
+        /// names, or `extra` for all extra bytes fields. `--fields xyz` compares
+        /// the position only.
+        #[arg(long, value_delimiter = ',')]
+        fields: Option<Vec<String>>,
+        /// Don't compare these fields (comma-separated, names as for --fields).
+        #[arg(long, value_delimiter = ',')]
+        ignore: Vec<String>,
+        /// Only say whether and where (which tiles) the files differ, without
+        /// finding the points.
+        #[arg(long)]
+        quick: bool,
+        /// Examples to show per kind of difference.
+        #[arg(long, default_value_t = 10)]
+        limit: usize,
+        /// No progress bar.
+        #[arg(long)]
+        no_progress: bool,
+        /// Target X + Y points per tile.
+        #[arg(long, hide = true, default_value_t = diff::DEFAULT_TILE_POINTS)]
+        tile_points: u64,
     },
     /// Show header, VLRs, COPC info and per-level hierarchy statistics.
     Info {
@@ -138,8 +170,22 @@ fn splitmix(state: &mut u64) -> u64 {
     z ^ (z >> 31)
 }
 
-fn main() -> Result<()> {
+fn main() -> ExitCode {
     let cli = Cli::parse();
+    // diff follows cmp/diff: 1 means "different", so errors exit with 2.
+    let error_code = if matches!(cli.cmd, Cmd::Diff { .. }) { 2 } else { 1 };
+    match run(cli) {
+        Ok(true) => ExitCode::SUCCESS,
+        Ok(false) => ExitCode::from(1),
+        Err(e) => {
+            eprintln!("Error: {e:?}");
+            ExitCode::from(error_code)
+        }
+    }
+}
+
+/// Ok(false) only for a diff that found differences.
+fn run(cli: Cli) -> Result<bool> {
     if let Some(n) = cli.threads {
         rayon::ThreadPoolBuilder::new().num_threads(n).build_global()?;
     }
@@ -174,9 +220,14 @@ fn main() -> Result<()> {
                 progress: !no_progress,
             };
             c2c::run(&a, &b, &output, &opt)?;
-            Ok(())
+            Ok(true)
         }
-        Cmd::Info { file, bench } => info::run(&file, bench),
+        Cmd::Diff { x, y, fields, ignore, quick, limit, no_progress, tile_points } => {
+            let (x, y) = (CopcFile::open(&x)?, CopcFile::open(&y)?);
+            let opt = diff::Options { fields, ignore, tile_points, quick, limit, progress: !no_progress };
+            Ok(diff::run(&x, &y, &opt)?.equal)
+        }
+        Cmd::Info { file, bench } => info::run(&file, bench).map(|()| true),
         Cmd::Passthrough { input, output, fields, scale, value, random_max } => {
             let a = CopcFile::open(&input)?;
             let fields: Vec<ScaledField> = (0..fields)
@@ -196,7 +247,7 @@ fn main() -> Result<()> {
                     })
                     .collect()
             })?;
-            Ok(())
+            Ok(true)
         }
     }
 }

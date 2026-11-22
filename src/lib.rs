@@ -2,6 +2,7 @@
 //! See `PLAN.md` for the design.
 
 pub mod c2c;
+pub mod diff;
 pub mod extra_bytes;
 pub mod info;
 pub mod input;

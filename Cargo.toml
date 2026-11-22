@@ -18,6 +18,7 @@ memmap2 = "0.9"
 nalgebra = { version = "0.34", default-features = false, features = ["std"] }
 pollster = "0.4"
 rayon = "1"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
 
 # CPU-bound binary: cross-crate inlining into the las/laz codec loops.
 [profile.release]
