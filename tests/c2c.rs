@@ -389,3 +389,34 @@ fn splice_equals_reencode() {
     assert!(std::fs::read(&sp).unwrap() == std::fs::read(&re).unwrap(), "untwine: spliced and re-encoded files differ");
     common::assert_no_new_issues(&u, &sp);
 }
+
+#[test]
+fn distribution_matches_read_back() {
+    // The statistics printed after a run equal those of the values read back,
+    // computed independently (sorted median, two-pass variance).
+    let a = copc("dist_a", 6, [0.001; 3], [0.0; 3], &cloud(21, 30_000));
+    let b = copc("dist_b", 6, [0.001; 3], [0.0; 3], &cloud(22, 30_000));
+    let out = scratch("dist_out.copc.laz");
+    let o = Options { components: true, plane_k: Some(8), ..opts(1.0, 10_000) };
+    let s = run(&a, &b, &out, &o);
+    assert!(s.stats.shared_points > 0, "test needs shared nodes");
+    let cap = (5.0 / s.scale).round() as i32;
+    let vals: Vec<Vec<i32>> = fields_of(&out, 5).into_iter().map(|(_, v)| v).filter(|v| v[0] != cap).collect();
+    assert!(!vals.is_empty() && (vals.len() as u64) < s.stats.a_points, "test needs points on both sides of the cap");
+    assert_eq!(s.distribution.len(), 5);
+    for (f, got) in s.distribution.iter().enumerate() {
+        let got = got.as_ref().unwrap();
+        let mut x: Vec<i64> = vals.iter().map(|v| i64::from(v[f])).collect();
+        x.sort_unstable();
+        let n = x.len();
+        let mean = x.iter().sum::<i64>() as f64 / n as f64;
+        let var = x.iter().map(|&v| (v as f64 - mean).powi(2)).sum::<f64>() / n as f64;
+        let median = (x[(n - 1) / 2] + x[n / 2]) as f64 / 2.0;
+        let sc = s.scale;
+        assert_eq!(got.n, n as u64, "field {f}");
+        assert_eq!((got.min, got.max, got.median), (x[0] as f64 * sc, x[n - 1] as f64 * sc, median * sc), "field {f}");
+        assert!((got.mean - mean * sc).abs() < 1e-12, "field {f}: mean {} vs {}", got.mean, mean * sc);
+        assert!((got.stddev - var.sqrt() * sc).abs() < 1e-9, "field {f}: stddev {} vs {}", got.stddev, var.sqrt() * sc);
+        assert_eq!(got.median_error, 0.0);
+    }
+}

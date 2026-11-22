@@ -1,6 +1,6 @@
 [package]
 name = "copc_compare"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Cloud-to-cloud distances between COPC files, written out as COPC"
 license = "MIT"

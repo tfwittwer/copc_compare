@@ -11,6 +11,7 @@
 
 use std::num::NonZeroUsize;
 use std::path::Path;
+use std::sync::Mutex;
 use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
@@ -20,6 +21,7 @@ use kiddo::{ImmutableKdTree, SquaredEuclidean};
 use nalgebra::{Matrix3, SymmetricEigen, Vector3};
 use rayon::prelude::*;
 
+use crate::distribution::{self, Distribution, FieldSummary};
 use crate::extra_bytes::ScaledField;
 use crate::input::CopcFile;
 use crate::pipeline::ordered_parallel;
@@ -229,6 +231,9 @@ pub struct Summary {
     pub scale: f64,
     pub b_points: u64,
     pub fields: Vec<String>,
+    /// Per field, over the points with a neighbour within max-dist (`None` if
+    /// there are none).
+    pub distribution: Vec<Option<FieldSummary>>,
 }
 
 fn check_crs(a: &CopcFile, b: &CopcFile, force: bool) -> Result<()> {
@@ -269,6 +274,7 @@ struct TileOut {
     /// `n_fields` values per shared point of the tile.
     shared_values: Vec<i32>,
     stats: Stats,
+    dist: Distribution,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -289,6 +295,8 @@ struct Ctx<'a> {
     plane_k: Option<NonZeroUsize>,
     max_dist: f64,
     cap: i32,
+    /// Raw values of points with a neighbour lie within ±bound.
+    bound: i64,
     eps: f64,
 }
 
@@ -503,8 +511,10 @@ impl Ctx<'_> {
         let shared = &self.shared_by_tile[t];
         let nf = self.layout.n;
         let mut stats = Stats::new(nf);
+        let dist = Mutex::new(Distribution::new(nf, self.bound));
         if owned.is_empty() && shared.is_empty() {
-            return Ok(TileOut { chunks: Vec::new(), shared_values: Vec::new(), stats });
+            let dist = dist.into_inner().unwrap();
+            return Ok(TileOut { chunks: Vec::new(), shared_values: Vec::new(), stats, dist });
         }
         stats.tiles_run = 1;
         let t0 = Instant::now();
@@ -552,6 +562,7 @@ impl Ctx<'_> {
                     s.outside_tile += u64::from(!contains(&inside, p));
                 }
                 s.spliced = u64::from(self.record.splices(compressed));
+                dist.lock().unwrap().add(&vals, self.cap);
                 let bytes = self.record.encode(compressed, &c, &vals)?;
                 Ok(((e.key, e.point_count, bytes), s))
             })
@@ -572,12 +583,14 @@ impl Ctx<'_> {
             stats.add(out, m);
             stats.shared_points += 1;
         }
+        let mut dist = dist.into_inner().unwrap();
+        dist.add(&shared_values, self.cap);
         let t3 = Instant::now();
         stats.secs_b_decode = (t1 - t0).as_secs_f64();
         stats.secs_tree = (t2 - t1).as_secs_f64();
         stats.secs_a = (t3 - t2).as_secs_f64();
         stats.secs_max_tile = (t3 - t0).as_secs_f64();
-        Ok(TileOut { chunks, shared_values, stats })
+        Ok(TileOut { chunks, shared_values, stats, dist })
     }
 }
 
@@ -601,6 +614,7 @@ pub fn run(a: &CopcFile, b: &CopcFile, out: &Path, opt: &Options) -> Result<Summ
     // Components and plane distances lie within ±max_dist, the cap is 5 × max_dist.
     fields[0].check_range(5.0 * opt.max_dist)?;
     let cap = fields[0].encode(5.0 * opt.max_dist);
+    let bound = i64::from(fields[0].encode(opt.max_dist)) + 1;
     // A few coordinate scale units: points may sit just outside their node box.
     let eps = 4.0 * all_scales.iter().copied().fold(0.0, f64::max);
 
@@ -643,6 +657,7 @@ pub fn run(a: &CopcFile, b: &CopcFile, out: &Path, opt: &Options) -> Result<Summ
         plane_k: opt.plane_k.and_then(NonZeroUsize::new),
         max_dist: opt.max_dist,
         cap,
+        bound,
         eps,
     };
 
@@ -660,6 +675,7 @@ pub fn run(a: &CopcFile, b: &CopcFile, out: &Path, opt: &Options) -> Result<Summ
     };
 
     let mut stats = Stats::new(nf);
+    let mut dist = Distribution::new(nf, bound);
     let tile_ids: Vec<usize> = (0..cut.tiles.len()).collect();
     ordered_parallel(
         &tile_ids,
@@ -674,6 +690,7 @@ pub fn run(a: &CopcFile, b: &CopcFile, out: &Path, opt: &Options) -> Result<Summ
                 shared_values[sp.node as usize][at..at + nf].copy_from_slice(v);
             }
             stats.merge(&out.stats);
+            dist.merge(&out.dist);
             bar.inc(out.stats.a_points);
             Ok(())
         },
@@ -755,7 +772,14 @@ pub fn run(a: &CopcFile, b: &CopcFile, out: &Path, opt: &Options) -> Result<Summ
         stats.spliced,
         written.chunks,
     );
-    Ok(Summary { stats, tiles: cut.tiles.len(), scale, b_points, fields: names })
+    let distribution = dist.summaries(scale);
+    eprint!(
+        "  distribution over the {} points with a neighbour within {} m, in m:\n{}",
+        stats.a_points - stats.beyond_cap,
+        opt.max_dist,
+        distribution::table(&names, &distribution, scale)
+    );
+    Ok(Summary { stats, tiles: cut.tiles.len(), scale, b_points, fields: names, distribution })
 }
 
 #[cfg(test)]

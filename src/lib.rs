@@ -3,6 +3,7 @@
 
 pub mod c2c;
 pub mod diff;
+pub mod distribution;
 pub mod extra_bytes;
 pub mod info;
 pub mod input;
