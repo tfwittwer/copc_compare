@@ -70,6 +70,38 @@ fn main() -> Result<()> {
         println!("  {name:<22} {:>6.0} ns/query (mean d {:.4} m)", t.elapsed().as_secs_f64() / qs.len() as f64 * 1e9, acc / qs.len() as f64);
     };
     time("dedup, node order", &q);
+    // Same, as an f64 tree (coordinates relative to the centre in f64).
+    {
+        let d64: Vec<[f64; 3]> = keyed.iter().map(|k| std::array::from_fn(|i| k[i] as f64 / 1000.0 - c[i])).collect();
+        let t = Instant::now();
+        let tree64: ImmutableKdTree<f64, 3> = ImmutableKdTree::new_from_slice(&d64).unwrap();
+        let build = t.elapsed().as_secs_f64() / d64.len() as f64 * 1e9;
+        let q64: Vec<[f64; 3]> = qa.iter().map(|p| std::array::from_fn(|i| p[i] - c[i])).collect();
+        let t = Instant::now();
+        let mut acc = 0.0f64;
+        for p in &q64 {
+            acc += tree64.query(p).nearest_one::<SquaredEuclidean<f64>>().execute().distance.sqrt();
+        }
+        println!(
+            "  {:<22} {:>6.0} ns/query (mean d {:.4} m), build {build:.0} ns/pt",
+            "f64 tree, node order",
+            t.elapsed().as_secs_f64() / q64.len() as f64 * 1e9,
+            acc / q64.len() as f64
+        );
+    }
+    // Bounded by max-dist (1 m): queries without a neighbour that close stop early.
+    let t = Instant::now();
+    let mut beyond = 0usize;
+    for p in &q {
+        let r = tree.query(p).nearest_n::<SquaredEuclidean<f32>>(std::num::NonZeroUsize::new(1).unwrap()).within(1.0).execute();
+        beyond += usize::from(r.is_empty());
+    }
+    println!(
+        "  {:<22} {:>6.0} ns/query ({:.1} % beyond 1 m)",
+        "dedup, within 1 m",
+        t.elapsed().as_secs_f64() / q.len() as f64 * 1e9,
+        100.0 * beyond as f64 / q.len() as f64
+    );
     let mut sorted = q.clone();
     sorted.sort_by_key(|p| ((p[0] * 2.0).floor() as i32, (p[1] * 2.0).floor() as i32, (p[2] * 2.0).floor() as i32));
     time("sorted by 0.5 m cells", &sorted);

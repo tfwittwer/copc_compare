@@ -25,6 +25,12 @@ lto = "thin"
 codegen-units = 1
 
 
+[features]
+default = ["simd"]
+# kiddo's handwritten SIMD leaf scans (AVX2 / AVX-512 on x86_64; nightly per
+# kiddo's docs, use --no-default-features otherwise). ~17 % faster c2c.
+simd = ["kiddo/simd"]
+
 [dev-dependencies]
 byteorder = "1"
 copc-reader = "0.10"

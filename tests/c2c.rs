@@ -163,20 +163,48 @@ fn rand01(s: &mut u64) -> f64 {
     ((z ^ (z >> 31)) >> 11) as f64 / (1u64 << 53) as f64
 }
 
+/// Random clouds: A 250 k, B 150 k shifted 5 m (so a strip has no neighbours),
+/// A at 1 mm, B at 1 cm. Built once per test binary.
+fn random_pair() -> (PathBuf, PathBuf) {
+    static PAIR: std::sync::OnceLock<(PathBuf, PathBuf)> = std::sync::OnceLock::new();
+    PAIR.get_or_init(|| {
+        let mut s = 42;
+        let cloud = |s: &mut u64, n: usize, x0: f64| -> Vec<[f64; 3]> {
+            (0..n).map(|_| [x0 + 40.0 * rand01(s), 480_000.0 + 40.0 * rand01(s), 4.0 * rand01(s)]).collect()
+        };
+        let a = cloud(&mut s, 250_000, 120_000.0);
+        let b = cloud(&mut s, 150_000, 120_005.0); // overlaps A on 35 of 40 m
+        let (a_las, b_las) = (scratch("rand_a.las"), scratch("rand_b.las"));
+        write_las(&a_las, 0.001, [120_000.0, 480_000.0, 0.0], &a);
+        write_las(&b_las, 0.01, [100_000.0, 400_000.0, 0.0], &b);
+        let (a_copc, b_copc) = (scratch("rand_a.copc.laz"), scratch("rand_b.copc.laz"));
+        convert(&[a_las], &a_copc, None);
+        convert(&[b_las], &b_copc, None);
+        (a_copc, b_copc)
+    })
+    .clone()
+}
+
+/// The result must not depend on the tiling (which follows from --threads and
+/// --memory-limit): at a 1 µm distance scale, where any difference in the
+/// neighbour picked among near-ties would show, two tilings give identical nodes.
+#[test]
+fn tiling_independent_at_fine_scale() {
+    let (a, b) = random_pair();
+    let mut outs = Vec::new();
+    for tile_points in [20_000, 10_000_000] {
+        let out = scratch(&format!("rand_fine_{tile_points}.copc.laz"));
+        let o = Options { dist_scale: Some(1e-6), components: true, ..opts(0.5, tile_points) };
+        let s = run(&a, &b, &out, &o);
+        assert!(tile_points > 1_000_000 || s.tiles >= 8);
+        outs.push(out);
+    }
+    assert_same_nodes(&outs[0], &outs[1]);
+}
+
 #[test]
 fn random_clouds_match_oracle() {
-    let mut s = 42;
-    let cloud = |s: &mut u64, n: usize, x0: f64| -> Vec<[f64; 3]> {
-        (0..n).map(|_| [x0 + 40.0 * rand01(s), 480_000.0 + 40.0 * rand01(s), 4.0 * rand01(s)]).collect()
-    };
-    let a = cloud(&mut s, 250_000, 120_000.0);
-    let b = cloud(&mut s, 150_000, 120_005.0); // overlaps A on 35 of 40 m
-    let (a_las, b_las) = (scratch("rand_a.las"), scratch("rand_b.las"));
-    write_las(&a_las, 0.001, [120_000.0, 480_000.0, 0.0], &a);
-    write_las(&b_las, 0.01, [100_000.0, 400_000.0, 0.0], &b);
-    let (a_copc, b_copc) = (scratch("rand_a.copc.laz"), scratch("rand_b.copc.laz"));
-    convert(&[a_las], &a_copc, None);
-    convert(&[b_las], &b_copc, None);
+    let (a_copc, b_copc) = random_pair();
 
     let max_dist = 0.5;
     let out = scratch("rand_out.copc.laz");

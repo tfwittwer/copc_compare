@@ -13,15 +13,18 @@ use crate::input::CopcFile;
 use crate::write::{CopcWriter, WriteSummary};
 
 /// Run `work` on every item on the rayon pool and hand the results to `sink` on
-/// the calling thread, in item order. At most `max_ahead` items are in flight
-/// or waiting in the reorder buffer, which bounds memory. The first error stops
-/// new work and is returned once running items have finished.
+/// the calling thread, in item order. At most `max_running` items run at once,
+/// and items are started at most `2 × max_running` ahead of the next one to
+/// deliver, so up to `2 × max_running - 1` finished results can wait in the
+/// reorder buffer behind a slow item instead of stalling the others. Both bound
+/// memory. The first error stops new work and is returned once running items
+/// have finished.
 ///
 /// Must not be called from inside a rayon worker: the calling thread blocks
 /// while it waits for results.
 pub fn ordered_parallel<T, R>(
     items: &[T],
-    max_ahead: usize,
+    max_running: usize,
     work: impl Fn(usize, &T) -> Result<R> + Sync,
     mut sink: impl FnMut(usize, R) -> Result<()>,
 ) -> Result<()>
@@ -29,7 +32,8 @@ where
     T: Sync,
     R: Send,
 {
-    let max_ahead = max_ahead.max(1);
+    let max_running = max_running.max(1);
+    let window = 2 * max_running;
     let (tx, rx) = mpsc::channel::<(usize, Result<R>)>();
     let work = &work;
     rayon::in_place_scope(|s| {
@@ -38,7 +42,7 @@ where
         let mut pending: BTreeMap<usize, R> = BTreeMap::new();
         let mut in_flight = 0usize;
         while next_emit < items.len() {
-            while next_spawn < items.len() && next_spawn < next_emit + max_ahead {
+            while next_spawn < items.len() && in_flight < max_running && next_spawn < next_emit + window {
                 let tx = tx.clone();
                 let i = next_spawn;
                 s.spawn(move |_| {
@@ -118,7 +122,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
-    fn delivers_in_order_with_bounded_lookahead() {
+    fn delivers_in_order_with_bounded_running() {
         let items: Vec<usize> = (0..200).collect();
         let running = AtomicUsize::new(0);
         let peak = AtomicUsize::new(0);

@@ -37,7 +37,7 @@ enum Cmd {
         #[arg(long)]
         max_dist: f64,
         /// Distance resolution in metres (default: the finer coordinate scale of
-        /// the two files).
+        /// the two files, but at least 0.1 mm).
         #[arg(long)]
         dist_scale: Option<f64>,
         /// Also write the offset to the nearest neighbour, compared minus

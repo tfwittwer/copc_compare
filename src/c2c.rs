@@ -14,7 +14,7 @@ use std::path::Path;
 use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
-use copc_streaming::{Fields, HierarchyEntry, VoxelKey};
+use copc_streaming::{Aabb, Fields, HierarchyEntry, VoxelKey};
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use kiddo::{ImmutableKdTree, SquaredEuclidean};
 use nalgebra::{Matrix3, SymmetricEigen, Vector3};
@@ -33,11 +33,32 @@ pub const FIELD_DESCRIPTION: &str = "C2C dist m; >max = 5*max";
 /// treated as degenerate (neighbours nearly collinear): fall back to NN.
 const DEGENERATE: f64 = 1e-3;
 
-/// Peak bytes per compared + reference point of a tile in flight: reference
-/// positions (f64, 24 B), kd-tree (f32 + index, ~16 B), compressed output and
-/// per-node buffers. Measured ~56 B/pt on the real pair (RSS minus mapped files).
-pub const BYTES_PER_TILE_POINT: u64 = 60;
+/// Peak bytes per compared + reference point of a running tile: reference
+/// positions (f64, 24 B), kd-tree (f64 + index, ~28 B), compressed output and
+/// per-node buffers (~56 B/pt measured with an f32 tree, RSS minus mapped
+/// files, so ~70 B/pt with f64); plus up to two finished tiles per running one
+/// waiting in the reorder buffer with their compressed output (~12 B per
+/// compared point for PF7).
+pub const BYTES_PER_TILE_POINT: u64 = 96;
 pub const DEFAULT_TILE_POINTS: u64 = 8_000_000;
+/// Tiles get as large as the memory budget allows, up to this: larger tiles
+/// re-decode fewer reference nodes at their borders.
+pub const MAX_TILE_POINTS: u64 = 64_000_000;
+/// Below this the border re-decodes dominate; run fewer tiles at once instead.
+pub const MIN_TILE_POINTS: u64 = 1_000_000;
+/// Tiles are also kept small enough that each tile in flight gets this many on
+/// average, so the run doesn't end with a few big tiles running alone.
+pub const TILES_PER_SLOT: u64 = 2;
+
+/// The default distance scale is the finer coordinate scale of the two files,
+/// but not below this: some converters store absurd scales (e.g. 6 nm), which
+/// carry no information, compress badly and overflow i32 for larger max-dist.
+pub const MIN_DEFAULT_SCALE: f64 = 1e-4;
+
+/// Default distance scale for files with these coordinate scales.
+pub fn default_scale(coordinate_scales: &[f64]) -> f64 {
+    coordinate_scales.iter().copied().fold(f64::INFINITY, f64::min).max(MIN_DEFAULT_SCALE)
+}
 
 pub struct Options {
     /// Neighbours farther than this count as "none"; also the tile buffer.
@@ -74,15 +95,18 @@ impl Options {
     }
 }
 
-/// Tile size and tiles in flight for a memory budget: as many default-size
-/// tiles as fit (at most one per thread); smaller tiles only if not even one fits.
-/// Mapped input files don't count: they live in the page cache.
+/// Tile size and tiles in flight for a memory budget: one tile per thread, as
+/// large as the budget allows (at most `MAX_TILE_POINTS`); fewer tiles at once
+/// if they would get smaller than `MIN_TILE_POINTS`. Mapped input files don't
+/// count: they live in the page cache.
 pub fn tiling_for_memory(limit_bytes: u64, threads: usize) -> (u64, usize) {
     let usable = limit_bytes / 4 * 3;
-    let per_tile = DEFAULT_TILE_POINTS * BYTES_PER_TILE_POINT;
-    let in_flight = ((usable / per_tile) as usize).clamp(1, threads.max(1));
-    let tile_points = (usable / (in_flight as u64 * BYTES_PER_TILE_POINT)).clamp(100_000, DEFAULT_TILE_POINTS);
-    (tile_points, in_flight)
+    let per_point = |n: usize| usable / (n as u64 * BYTES_PER_TILE_POINT);
+    let mut in_flight = threads.max(1);
+    if per_point(in_flight) < MIN_TILE_POINTS {
+        in_flight = ((usable / (MIN_TILE_POINTS * BYTES_PER_TILE_POINT)) as usize).clamp(1, in_flight);
+    }
+    (per_point(in_flight).clamp(100_000, MAX_TILE_POINTS), in_flight)
 }
 
 /// Half the physical memory, or 8 GiB if that can't be read.
@@ -270,12 +294,72 @@ struct Ctx<'a> {
     eps: f64,
 }
 
-/// Neighbour lookup for one tile: kd-tree in f32 relative to the tile centre,
+/// Neighbour lookup for one tile: kd-tree in f64 relative to the tile centre,
 /// distances recomputed in f64 from the original coordinates.
 struct Neighbours {
-    tree: Option<ImmutableKdTree<f32, 3>>,
+    tree: Option<ImmutableKdTree<f64, 3>>,
     points: Vec<[f64; 3]>,
     center: [f64; 3],
+    occupancy: Occupancy,
+}
+
+/// Conservative "is any point within max_dist?" test: a bitmap of occupied
+/// cells at least max_dist wide over the tile's reach box. If none of the 27
+/// cells around a query holds a point, nothing is within max_dist. Without it
+/// such queries (often ~5 % of points) search out to their true, useless,
+/// nearest neighbour, which in dense data costs ~10 µs each.
+struct Occupancy {
+    min: [f64; 3],
+    cell: f64,
+    dims: [i64; 3],
+    bits: Vec<u64>,
+}
+
+impl Occupancy {
+    /// At most this many cells per axis (bitmap ≤ 8 MB); cells grow to fit.
+    const MAX_DIM: f64 = 400.0;
+
+    fn new(points: &[[f64; 3]], reach: &Aabb, max_dist: f64) -> Self {
+        let size = (0..3).map(|a| reach.max[a] - reach.min[a]).fold(0.0, f64::max);
+        let cell = max_dist.max(size / Self::MAX_DIM);
+        let dims: [i64; 3] = std::array::from_fn(|a| ((reach.max[a] - reach.min[a]) / cell).floor() as i64 + 1);
+        let n = (dims[0] * dims[1] * dims[2]) as usize;
+        let mut o = Self { min: reach.min, cell, dims, bits: vec![0; n.div_ceil(64)] };
+        for p in points {
+            if let Some(i) = o.index(o.cell_of(*p)) {
+                o.bits[i / 64] |= 1 << (i % 64);
+            }
+        }
+        o
+    }
+
+    #[inline]
+    fn cell_of(&self, p: [f64; 3]) -> [i64; 3] {
+        std::array::from_fn(|a| ((p[a] - self.min[a]) / self.cell).floor() as i64)
+    }
+
+    #[inline]
+    fn index(&self, c: [i64; 3]) -> Option<usize> {
+        (0..3).all(|a| (0..self.dims[a]).contains(&c[a])).then(|| ((c[2] * self.dims[1] + c[1]) * self.dims[0] + c[0]) as usize)
+    }
+
+    /// False if certainly no point lies within max_dist of `p`.
+    #[inline]
+    fn maybe_within(&self, p: [f64; 3]) -> bool {
+        let c = self.cell_of(p);
+        for dz in -1..=1 {
+            for dy in -1..=1 {
+                for dx in -1..=1 {
+                    if let Some(i) = self.index([c[0] + dx, c[1] + dy, c[2] + dz])
+                        && self.bits[i / 64] & (1 << (i % 64)) != 0
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
 }
 
 #[inline]
@@ -284,45 +368,58 @@ fn dist(p: [f64; 3], q: [f64; 3]) -> f64 {
 }
 
 impl Neighbours {
-    fn new(mut points: Vec<[f64; 3]>, center: [f64; 3]) -> Result<Self> {
+    /// `reach`: a box containing all `points` and every query point grown by
+    /// `max_dist`.
+    fn new(mut points: Vec<[f64; 3]>, center: [f64; 3], reach: &Aabb, max_dist: f64) -> Result<Self> {
         // Exact duplicates can't change a nearest distance (or a plane fit to the
         // distinct points), but they bloat the kd-tree leaves (unsplittable).
         // Dense mobile-mapping data can be half duplicates at 1 mm; dropping
         // them made queries ~35-45 % faster.
         points.par_sort_unstable_by_key(|p| p.map(f64::to_bits));
         points.dedup_by_key(|p| p.map(f64::to_bits));
-        let rel: Vec<[f32; 3]> = points.iter().map(|p| std::array::from_fn(|a| (p[a] - center[a]) as f32)).collect();
+        // f64, not f32: with f32 the neighbour picked among near-ties depended on
+        // the tile centre, so different tilings (thread count, memory limit)
+        // gave 1-unit differences in ~1e-7 of the points. f64 queries were
+        // measured as fast as f32 ones.
+        let rel: Vec<[f64; 3]> = points.iter().map(|p| std::array::from_fn(|a| p[a] - center[a])).collect();
         let tree = if rel.is_empty() {
             None
         } else {
             Some(ImmutableKdTree::new_from_slice_parallel(&rel).map_err(|e| anyhow!("kd-tree: {e:?}"))?)
         };
-        Ok(Self { tree, points, center })
+        let occupancy = Occupancy::new(&points, reach, max_dist);
+        Ok(Self { tree, points, center, occupancy })
     }
 
     #[inline]
-    fn query_point(&self, p: [f64; 3]) -> [f32; 3] {
-        std::array::from_fn(|a| (p[a] - self.center[a]) as f32)
+    fn query_point(&self, p: [f64; 3]) -> [f64; 3] {
+        std::array::from_fn(|a| p[a] - self.center[a])
     }
 
-    /// The nearest point: (distance, index).
+    /// The nearest point if one lies within `max_dist`: (distance, index).
+    /// `nearest_one` has kiddo's SIMD leaf scan (feature `simd`); the occupancy
+    /// test keeps it from searching far for points without close neighbours.
     #[inline]
-    fn nearest(&self, p: [f64; 3]) -> Option<(f64, usize)> {
+    fn nearest_within(&self, p: [f64; 3], max_dist: f64) -> Option<(f64, usize)> {
+        if !self.occupancy.maybe_within(p) {
+            return None;
+        }
         let tree = self.tree.as_ref()?;
-        let nn = tree.query(&self.query_point(p)).nearest_one::<SquaredEuclidean<f32>>().execute();
+        let nn = tree.query(&self.query_point(p)).nearest_one::<SquaredEuclidean<f64>>().execute();
         let i = nn.item as usize;
-        Some((dist(p, self.points[i]), i))
+        Some((dist(p, self.points[i]), i)).filter(|&(d, _)| d <= max_dist)
     }
 
     /// Up to `k` nearest points within `max_dist`, nearest first: (distance, index).
     fn within(&self, p: [f64; 3], k: NonZeroUsize, max_dist: f64) -> Vec<(f64, usize)> {
-        let Some(tree) = self.tree.as_ref() else { return Vec::new() };
-        // A hair wider in f32, then exact in f64: every B point within max_dist
+        let Some(tree) = self.tree.as_ref().filter(|_| self.occupancy.maybe_within(p)) else { return Vec::new() };
+        // A hair wider (relative coordinates round differently), then exact on
+        // the absolute coordinates: every B point within max_dist
         // is in this tile's tree, so the result doesn't depend on the tiling.
-        let r = (max_dist * (1.0 + 1e-4) + 1e-6) as f32;
+        let r = max_dist * (1.0 + 1e-9) + 1e-9;
         let mut out: Vec<(f64, usize)> = tree
             .query(&self.query_point(p))
-            .nearest_n::<SquaredEuclidean<f32>>(k)
+            .nearest_n::<SquaredEuclidean<f64>>(k)
             .within(r * r)
             .execute()
             .into_iter()
@@ -374,10 +471,10 @@ impl Ctx<'_> {
         let f = &self.fields[0];
         let (nn, plane) = match self.plane_k {
             Some(k) => {
-                let nbrs = self.within(nb, p, k);
+                let nbrs = nb.within(p, k, self.max_dist);
                 (nbrs.first().copied(), Some(nbrs))
             }
-            None => (nb.nearest(p).filter(|&(d, _)| d <= self.max_dist), None),
+            None => (nb.nearest_within(p, self.max_dist), None),
         };
         let Some((d, i)) = nn else {
             out.fill(self.cap);
@@ -401,10 +498,6 @@ impl Ctx<'_> {
             };
         }
         m
-    }
-
-    fn within(&self, nb: &Neighbours, p: [f64; 3], k: NonZeroUsize) -> Vec<(f64, usize)> {
-        nb.within(p, k, self.max_dist)
     }
 
     fn tile(&self, t: usize) -> Result<TileOut> {
@@ -442,7 +535,7 @@ impl Ctx<'_> {
             b_points.extend(v);
         }
         let t1 = Instant::now();
-        let nb = Neighbours::new(b_points, center)?;
+        let nb = Neighbours::new(b_points, center, &reach, self.max_dist)?;
         let t2 = Instant::now();
         stats.b_in_trees = nb.points.len() as u64;
         stats.max_b_in_tile = stats.b_in_trees;
@@ -501,7 +594,7 @@ pub fn run(a: &CopcFile, b: &CopcFile, out: &Path, opt: &Options) -> Result<Summ
         [h.x_scale_factor, h.y_scale_factor, h.z_scale_factor]
     };
     let all_scales: Vec<f64> = scales(a).into_iter().chain(scales(b)).collect();
-    let scale = opt.dist_scale.unwrap_or_else(|| all_scales.iter().copied().fold(f64::INFINITY, f64::min));
+    let scale = opt.dist_scale.unwrap_or_else(|| default_scale(&all_scales));
     let layout = Layout::new(opt);
     let fields = layout.fields(scale)?;
     let nf = layout.n;
@@ -511,7 +604,12 @@ pub fn run(a: &CopcFile, b: &CopcFile, out: &Path, opt: &Options) -> Result<Summ
     // A few coordinate scale units: points may sit just outside their node box.
     let eps = 4.0 * all_scales.iter().copied().fold(0.0, f64::max);
 
-    let cut = Cut::new(a, Some(b), opt.tile_points, 4.0 * opt.max_dist);
+    // Load balance: at least TILES_PER_SLOT tiles per tile in flight, so the
+    // last tiles don't run alone (but never below MIN_TILE_POINTS).
+    let total = a.las_header().number_of_points() + b.las_header().number_of_points();
+    let balanced = (total / (TILES_PER_SLOT * opt.tiles_in_flight.max(1) as u64)).max(MIN_TILE_POINTS);
+    let tile_points = opt.tile_points.min(balanced);
+    let cut = Cut::new(a, Some(b), tile_points, 4.0 * opt.max_dist);
 
     // Shared nodes: decode once, assign each point to the tile that contains it.
     let shared_chunks = cut.shared.par_iter().map(|e| a.decode(e, Fields::ALL)).collect::<Result<Vec<_>>>()?;
@@ -610,7 +708,7 @@ pub fn run(a: &CopcFile, b: &CopcFile, out: &Path, opt: &Options) -> Result<Summ
     eprintln!(
         "{} -> {}\n  \
          fields {}: i32 × {scale} m; beyond {} m stored as {} m{plane_note}\n  \
-         tiles: {} ({} with points, levels {}–{}), {} shared nodes ({} points); {} M points/tile, {} in flight\n  \
+         tiles: {} ({} with points, levels {}–{}), {} shared nodes ({} points); {:.1} M points/tile, {} in flight\n  \
          reference: {} points, {} decoded (re-decode factor {:.2}), {} in kd-trees, max {} per tile\n  \
          beyond max-dist: {} ({:.2} %)\n  \
          time: setup {:.2} s, tiles {:.2} s, shared + finish {:.2} s, total {secs:.2} s = {:.1} M pts/s\n  \
@@ -627,7 +725,7 @@ pub fn run(a: &CopcFile, b: &CopcFile, out: &Path, opt: &Options) -> Result<Summ
         cut.tiles.iter().map(|k| k.level).max().unwrap_or(0),
         cut.shared.len(),
         stats.shared_points,
-        opt.tile_points as f64 / 1e6,
+        tile_points as f64 / 1e6,
         opt.tiles_in_flight,
         b_points,
         stats.b_decoded,
@@ -655,7 +753,32 @@ mod tests {
     use super::*;
 
     fn nb(points: &[[f64; 3]]) -> Neighbours {
-        Neighbours::new(points.to_vec(), [0.0; 3]).unwrap()
+        let reach = Aabb { min: [-10.0; 3], max: [10.0; 3] };
+        Neighbours::new(points.to_vec(), [0.0; 3], &reach, 2.0).unwrap()
+    }
+
+    #[test]
+    fn occupancy_is_conservative() {
+        let reach = Aabb { min: [0.0; 3], max: [100.0; 3] };
+        let pts = [[50.0, 50.0, 50.0]];
+        for max_dist in [0.3, 1.0] {
+            let o = Occupancy::new(&pts, &reach, max_dist);
+            // Everything within max_dist passes, whatever the cell size.
+            for d in [[0.29, 0.0, 0.0], [0.0, -0.29, 0.0], [0.17, 0.17, -0.17]] {
+                assert!(o.maybe_within([50.0 + d[0], 50.0 + d[1], 50.0 + d[2]]));
+            }
+            // Far away is rejected.
+            assert!(!o.maybe_within([50.0 + 3.0 * o.cell, 50.0, 50.0]));
+            assert!(!o.maybe_within([0.0, 0.0, 0.0]));
+        }
+    }
+
+    #[test]
+    fn nearest_within_caps() {
+        let n = nb(&[[0.5, 0.0, 0.0], [0.0, 0.8, 0.0]]);
+        assert_eq!(n.nearest_within([0.0; 3], 0.6).map(|x| x.0), Some(0.5));
+        assert_eq!(n.nearest_within([0.0; 3], 0.4), None);
+        assert_eq!(n.nearest_within([9.0, 9.0, 9.0], 2.0), None);
     }
 
     #[test]
@@ -697,13 +820,29 @@ mod tests {
     }
 
     #[test]
+    fn default_scale_is_finer_but_floored() {
+        assert_eq!(default_scale(&[0.001, 0.001, 0.001, 0.0005, 0.0005, 0.0005]), 0.0005);
+        assert_eq!(default_scale(&[0.001, 0.001, 0.001, 1.3e-7, 1.0e-7, 6.0e-9]), MIN_DEFAULT_SCALE);
+    }
+
+    #[test]
     fn tiling_for_memory_fits() {
         let gb = 1u64 << 30;
-        assert_eq!(tiling_for_memory(64 * gb, 32), (DEFAULT_TILE_POINTS, 32));
-        assert_eq!(tiling_for_memory(4 * gb, 32), (DEFAULT_TILE_POINTS, 6));
-        let (t, n) = tiling_for_memory(gb / 2, 32);
-        assert_eq!(n, 1);
-        assert!(t < DEFAULT_TILE_POINTS && t * BYTES_PER_TILE_POINT <= gb / 2);
-        assert_eq!(tiling_for_memory(64 * gb, 4).1, 4);
+        let fits = |limit: u64, (t, n): (u64, usize)| t * n as u64 * BYTES_PER_TILE_POINT <= limit;
+        // Plenty: one tile per thread, capped size.
+        assert_eq!(tiling_for_memory(512 * gb, 8), (MAX_TILE_POINTS, 8));
+        // 31 GB, 8 threads: 8 tiles of ~37 M points.
+        let r = tiling_for_memory(31 * gb, 8);
+        assert_eq!(r.1, 8);
+        assert!(r.0 > 30_000_000 && fits(31 * gb, r));
+        // 4 GB, 32 threads: 32 tiles of just over 1 M points.
+        let r = tiling_for_memory(4 * gb, 32);
+        assert!(r.1 == 32 && r.0 >= MIN_TILE_POINTS && fits(4 * gb, r));
+        // 2 GB, 32 threads: tiles would be < 1 M, so fewer at once.
+        let r = tiling_for_memory(2 * gb, 32);
+        assert!(r.1 < 32 && r.0 >= MIN_TILE_POINTS && fits(2 * gb, r));
+        // Tiny budget: one small tile.
+        let r = tiling_for_memory(gb / 16, 32);
+        assert!(r.1 == 1 && r.0 < MIN_TILE_POINTS && fits(gb / 16, r));
     }
 }
